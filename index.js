@@ -14,6 +14,8 @@ const HISTORY_FILE_PATH = './history.json';
 const WORK_GROUP_ID = process.env.WORK_GROUP_ID || null;
 const REQUEST_IDENTIFICATION_PROMPT = "Does the user want to create a service request? Answer with 'yes' or 'no'.";
 const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
+const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in two words.";
+const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a detailed description of the user's issue **in russian**.";
 
 const SYSTEM_PROMPT = `Ты - Кристина. Твоя роль - администратор управляющей компании "Прогресс". Ты общаешься с жильцами и помогаешь им решать бытовые вопросы.
 
@@ -202,13 +204,28 @@ async function handleServiceRequest(chatId, history) {
         const phone = `+${chatId.split('@')[0]}`;
 
         if (address && issue) {
-            const requestMessage = `Новая заявка от жильца:
+            const summaryCompletion = await openai.chat.completions.create({
+                model: OPENAI_MODEL,
+                messages: [{ role: "user", content: `${ISSUE_SUMMARY_PROMPT}: ${issue}` }],
+                max_tokens: 10
+            });
+            const issueSummary = summaryCompletion.choices[0].message.content.trim();
 
-Телефон: ${phone}
-Адрес: ${address}
+            const detailedIssueCompletion = await openai.chat.completions.create({
+                model: OPENAI_MODEL,
+                messages: [...history, { role: "user", content: DETAILED_ISSUE_PROMPT }],
+                max_tokens: 150
+            });
+            const detailedIssue = detailedIssueCompletion.choices[0].message.content.trim();
 
-Суть проблемы:
-${issue}`;
+            const requestMessage = `🆕 Новая заявка от жильца
+
+📞 Телефон: ${phone}
+📍 Адрес: ${address}
+❗️ Проблема: ${issueSummary}
+
+📝 Описание:
+${detailedIssue}`;
             await client.sendMessage(WORK_GROUP_ID, requestMessage);
             console.log(`Service request from ${chatId} sent to work group.`);
         } else {
