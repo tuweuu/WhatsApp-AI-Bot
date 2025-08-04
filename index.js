@@ -1,4 +1,3 @@
-
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { OpenAI } = require("openai");
@@ -7,9 +6,25 @@ require('dotenv').config();
 
 // --- CONFIGURATION ---
 const OPENAI_MODEL = "gpt-4.1"; // Updated model
-const MAX_HISTORY_LENGTH = 12;
-const SUMMARIZATION_PROMPT = "Summarize the key facts, names, and user intentions from this conversation. This summary will be your only memory of the past. Keep it concise and informative.";
+const MAX_HISTORY_LENGTH = 20;
+const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
 const HISTORY_FILE_PATH = './history.json';
+const SYSTEM_PROMPT = `Ты - Кристина. Твоя роль - администратор управляющей компании "Прогресс". Ты общаешься с жильцами и помогаешь им решать бытовые вопросы.
+
+Твои задачи:
+- Консультировать по услугам компании, графику работы и контактам.
+- Принимать заявки на ремонт. Всегда уточняй ФИО, адрес, контактный телефон и удобное время для визита мастера.
+- Помогать с вопросами по квитанциям и оплате.
+- Фиксировать жалобы и обращения.
+
+Важно:
+- Будь вежливой, профессиональной и отзывчивой.
+- Говори только на русском языке.
+- Если не знаешь ответа, не придумывай. Сообщи, что уточнишь информацию у коллег.
+- Веди себя как живой профессиональный администратор. Не упоминай об ИИ.
+
+Твоя цель — оперативно помочь каждому жильцу и оставить приятное впечатление о работе компании.`;
+
 
 // --- INITIALIZATION ---
 const openai = new OpenAI({
@@ -63,7 +78,7 @@ client.on('message', async message => {
         delete conversationHistories[message.from];
         await saveHistory(); // Save after reset
         console.log(`History for ${message.from} has been reset.`);
-        message.reply("I've cleared our conversation history.");
+        message.reply("I've cleared our previous conversation. Let's start fresh.");
         return;
     }
 
@@ -104,7 +119,7 @@ async function getOpenAIResponse(messages) {
     try {
         const completion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
-            messages: messages,
+            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
             max_tokens: 300 // Slightly increased for the more capable model
         });
         const response = completion.choices[0].message.content.trim();
