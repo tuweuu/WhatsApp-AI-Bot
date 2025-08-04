@@ -27,3 +27,4 @@ yarn-error.log*
 .wwebjs_auth/
 history.json
 .wwebjs_cache/
+.wwebjs_cache
