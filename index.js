@@ -9,11 +9,17 @@ const OPENAI_MODEL = "gpt-4.1"; // Updated model
 const MAX_HISTORY_LENGTH = 20;
 const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
 const HISTORY_FILE_PATH = './history.json';
+
+// --- WORK GROUP INTEGRATION ---
+const WORK_GROUP_ID = process.env.WORK_GROUP_ID || null;
+const REQUEST_IDENTIFICATION_PROMPT = "Does the user want to create a service request? Answer with 'yes' or 'no'.";
+const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
+
 const SYSTEM_PROMPT = `Ты - Кристина. Твоя роль - администратор управляющей компании "Прогресс". Ты общаешься с жильцами и помогаешь им решать бытовые вопросы.
 
 Твои задачи:
 - Консультировать по услугам компании, графику работы и контактам.
-- Принимать заявки на ремонт. Всегда уточняй ФИО, адрес, контактный телефон и удобное время для визита мастера.
+- Принимать заявки на ремонт. Если жилец хочет оставить заявку, обязательно уточни, что тебе для этого нужны его адрес и удобное время для визита мастера. Получив всю информацию, подтверди, что заявка принята.
 - Помогать с вопросами по квитанциям и оплате.
 - Фиксировать жалобы и обращения.
 
@@ -72,7 +78,12 @@ client.on('ready', () => {
 });
 
 client.on('message', async message => {
-    if (message.from.endsWith('@g.us') || message.isStatus) return;
+    if (message.from.endsWith('@g.us')) {
+        console.log(`Message received from group: ${message.from}`);
+        return;
+    }    
+
+    if (message.isStatus) return;
 
     if (message.body.toLowerCase() === '!reset') {
         delete conversationHistories[message.from];
@@ -92,6 +103,10 @@ client.on('message', async message => {
         conversationHistories[message.from] = history;
         message.reply(aiResponse);
         await saveHistory(); // Save after each message
+
+        if (await isServiceRequest(history)) {
+            await handleServiceRequest(message.from, history);
+        }
 
         if (history.length > MAX_HISTORY_LENGTH) {
             console.log(`History for ${message.from} exceeds limit. Triggering summarization.`);
@@ -149,5 +164,57 @@ async function summarizeHistory(chatId) {
         console.log(`Summarization complete for ${chatId}.`);
     } catch (error) {
         console.error(`Failed to summarize history for ${chatId}:`, error);
+    }
+}
+
+// --- SERVICE REQUEST FUNCTIONS ---
+
+async function isServiceRequest(messages) {
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [...messages, { role: "user", content: REQUEST_IDENTIFICATION_PROMPT }],
+            max_tokens: 10
+        });
+        const response = completion.choices[0].message.content.trim().toLowerCase();
+        return response.includes('yes');
+    } catch (error) {
+        console.error("Error identifying service request:", error);
+        return false;
+    }
+}
+
+async function handleServiceRequest(chatId, history) {
+    if (!WORK_GROUP_ID) {
+        console.error("WORK_GROUP_ID is not set in the .env file. Cannot send service request.");
+        return;
+    }
+
+    try {
+        const extractionCompletion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [...history, { role: "user", content: REQUEST_EXTRACTION_PROMPT }],
+            response_format: { type: "json_object" },
+        });
+        const extractedData = JSON.parse(extractionCompletion.choices[0].message.content);
+
+        const { address, issue } = extractedData;
+        const phone = `+${chatId.split('@')[0]}`;
+
+        if (address && issue) {
+            const requestMessage = `Новая заявка от жильца:
+
+Телефон: ${phone}
+Адрес: ${address}
+
+Суть проблемы:
+${issue}`;
+            await client.sendMessage(WORK_GROUP_ID, requestMessage);
+            console.log(`Service request from ${chatId} sent to work group.`);
+        } else {
+            console.log(`Incomplete information for service request from ${chatId}. The bot will ask for more details.`);
+        }
+    } catch (error) {
+        console.error(`Error handling service request for ${chatId}:`, error);
     }
 }

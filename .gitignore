@@ -26,3 +26,4 @@ yarn-error.log*
 # Cache folder for whatsapp-web.js
 .wwebjs_auth/
 history.json
+.wwebjs_cache/
