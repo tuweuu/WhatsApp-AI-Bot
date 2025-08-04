@@ -12,10 +12,10 @@ const HISTORY_FILE_PATH = './history.json';
 
 // --- WORK GROUP INTEGRATION ---
 const WORK_GROUP_ID = process.env.WORK_GROUP_ID || null;
-const REQUEST_IDENTIFICATION_PROMPT = "Does the user want to create a service request? Answer with 'yes' or 'no'.";
+const REQUEST_CONFIRMATION_PROMPT = "Read the following message. Does it confirm that a service request has been successfully created and all necessary information (like address and time) has been collected? Answer only with 'yes' or 'no'.";
 const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
-const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in two words.";
-const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a detailed description of the user's issue **in russian**.";
+const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a few words.";
+const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a concise description of the user's issue **in Russian**, under 50 words.";
 
 const SYSTEM_PROMPT = `Ты - Кристина. Твоя роль - администратор управляющей компании "Прогресс". Ты общаешься с жильцами и помогаешь им решать бытовые вопросы.
 
@@ -24,6 +24,13 @@ const SYSTEM_PROMPT = `Ты - Кристина. Твоя роль - админи
 - Принимать заявки на ремонт. Если жилец хочет оставить заявку, обязательно уточни, что тебе для этого нужны его адрес и удобное время для визита мастера. Получив всю информацию, подтверди, что заявка принята.
 - Помогать с вопросами по квитанциям и оплате.
 - Фиксировать жалобы и обращения.
+
+Справочная информация:
+- График работы: с 9:00 до 18:00, с понедельника по пятницу.
+- Телефон офиса: +7 800 444 52 05.
+- Оплату можно произвести в мобильном приложении или в офисе управляющей компании.
+- Приложение для iOS: https://apps.apple.com/app/id6738488843
+- Приложение для Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
 
 Важно:
 - Будь вежливой, профессиональной и отзывчивой.
@@ -106,7 +113,7 @@ client.on('message', async message => {
         message.reply(aiResponse);
         await saveHistory(); // Save after each message
 
-        if (await isServiceRequest(history)) {
+        if (await isRequestCreationConfirmation(aiResponse)) {
             await handleServiceRequest(message.from, history);
         }
 
@@ -171,17 +178,20 @@ async function summarizeHistory(chatId) {
 
 // --- SERVICE REQUEST FUNCTIONS ---
 
-async function isServiceRequest(messages) {
+async function isRequestCreationConfirmation(messageContent) {
     try {
         const completion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
-            messages: [...messages, { role: "user", content: REQUEST_IDENTIFICATION_PROMPT }],
+            messages: [{
+                role: "user",
+                content: `${REQUEST_CONFIRMATION_PROMPT}\n\n${messageContent}`
+            }],
             max_tokens: 10
         });
         const response = completion.choices[0].message.content.trim().toLowerCase();
         return response.includes('yes');
     } catch (error) {
-        console.error("Error identifying service request:", error);
+        console.error("Error identifying request creation confirmation:", error);
         return false;
     }
 }
@@ -218,14 +228,7 @@ async function handleServiceRequest(chatId, history) {
             });
             const detailedIssue = detailedIssueCompletion.choices[0].message.content.trim();
 
-            const requestMessage = `🆕 Новая заявка от жильца
-
-📞 Телефон: ${phone}
-📍 Адрес: ${address}
-❗️ Проблема: ${issueSummary}
-
-📝 Описание:
-${detailedIssue}`;
+            const requestMessage = `🆕 Новая заявка от жильца\n\n📞 Телефон: ${phone}\n📍 Адрес: ${address}\n❗️ Проблема: ${issueSummary}\n\n📝 Описание:\n${detailedIssue}`;
             await client.sendMessage(WORK_GROUP_ID, requestMessage);
             console.log(`Service request from ${chatId} sent to work group.`);
         } else {
@@ -235,3 +238,4 @@ ${detailedIssue}`;
         console.error(`Error handling service request for ${chatId}:`, error);
     }
 }
+
