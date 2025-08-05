@@ -1,11 +1,12 @@
 const qrcode = require('qrcode-terminal');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const { OpenAI } = require("openai");
-const fs = require('fs').promises; // Using promises for async file operations
+const fs = require('fs').promises;
+const fsSync = require('fs');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
-const OPENAI_MODEL = "gpt-4.1"; // Updated model
+const OPENAI_MODEL = "gpt-4.1";
 const MAX_HISTORY_LENGTH = 20;
 const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
 const HISTORY_FILE_PATH = './history.json';
@@ -14,32 +15,34 @@ const HISTORY_FILE_PATH = './history.json';
 const WORK_GROUP_ID = process.env.WORK_GROUP_ID || null;
 const REQUEST_CONFIRMATION_PROMPT = "Read the following message. Does it confirm that a service request has been successfully created and all necessary information (like address and time) has been collected? Answer only with 'yes' or 'no'.";
 const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
-const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a few words.";
+const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a two-three words  **in Russian**.";
 const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a concise description of the user's issue **in Russian**, under 50 words.";
 
-const SYSTEM_PROMPT = `Ты - Кристина. Твоя роль - администратор управляющей компании "Прогресс". Ты общаешься с жильцами и помогаешь им решать бытовые вопросы.
+const SYSTEM_PROMPT = `Ты - Кристина, администратор УК "Прогресс".
 
 Твои задачи:
-- Консультировать по услугам компании, графику работы и контактам.
-- Принимать заявки на ремонт. Если жилец хочет оставить заявку, обязательно уточни, что тебе для этого нужны его адрес и удобное время для визита мастера. Получив всю информацию, подтверди, что заявка принята.
-- Помогать с вопросами по квитанциям и оплате.
-- Фиксировать жалобы и обращения.
+- Консультировать по услугам, графику, контактам.
+- Принимать заявки на ремонт: перед приемом заявки узнай как можно больше информации, например: проблема во всем доме или в одной квартире? уточни адрес и время, подтверди прием заявки.
+- Помогать с оплатой.
+- Фиксировать жалобы.
 
 Справочная информация:
-- График работы: с 9:00 до 18:00, с понедельника по пятницу.
-- Телефон офиса: +7 800 444 52 05.
-- Оплату можно произвести в мобильном приложении или в офисе управляющей компании.
-- Приложение для iOS: https://apps.apple.com/app/id6738488843
-- Приложение для Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
+- График: Пн-Пт, 9:00-18:00.
+- Адрес: Ирчи Казака 31.
+- Офис: +78004445205.
+- Оплата: в офисе или через приложение УК «Прогресс».
+  - iOS: https://apps.apple.com/app/id6738488843
+  - Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
 
 Важно:
-- Будь вежливой, профессиональной и отзывчивой.
-- Говори только на русском языке.
-- Если не знаешь ответа, не придумывай. Сообщи, что уточнишь информацию у коллег.
-- Веди себя как живой профессиональный администратор. Не упоминай об ИИ.
+- Будь профессиональной и четкой. Избегай излишней эмпатии и фраз вроде "Мы понимаем ваше расстройство".
+- Отвечай кратко и по делу.
+- Ссылки отправляй как обычный текст, без форматирования.
+- Говори только на русском.
+- Не придумывай, если не знаешь ответ.
+- Не упоминай, что ты ИИ.
 
-Твоя цель — оперативно помочь каждому жильцу и оставить приятное впечатление о работе компании.`;
-
+Цель: быстро помочь и оставить приятное впечатление.`;
 
 // --- INITIALIZATION ---
 const openai = new OpenAI({
@@ -50,7 +53,7 @@ const client = new Client({
     authStrategy: new LocalAuth()
 });
 
-let conversationHistories = {}; // Let it be mutable
+let conversationHistories = {};
 
 // --- PERSISTENCE FUNCTIONS ---
 async function saveHistory() {
@@ -64,7 +67,7 @@ async function saveHistory() {
 
 async function loadHistory() {
     try {
-        await fs.access(HISTORY_FILE_PATH); // Check if file exists
+        await fs.access(HISTORY_FILE_PATH);
         const data = await fs.readFile(HISTORY_FILE_PATH, 'utf8');
         conversationHistories = JSON.parse(data);
         console.log("Successfully loaded conversation history from file.");
@@ -90,28 +93,71 @@ client.on('message', async message => {
     if (message.from.endsWith('@g.us')) {
         console.log(`Message received from group: ${message.from}`);
         return;
-    }    
+    }
 
     if (message.isStatus) return;
 
-    if (message.body.toLowerCase() === '!reset') {
+    const history = conversationHistories[message.from] || [];
+    let messageBody = message.body;
+    let userHistoryEntry;
+
+    if (message.hasMedia && message.type === 'image') {
+        try {
+            console.log("Received image message, processing...");
+            const media = await message.downloadMedia();
+            const openAIContent = [
+                { type: 'text', text: message.body },
+                { type: 'image_url', image_url: { url: `data:${media.mimetype};base64,${media.data}` } }
+            ];
+            userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
+        } catch (error) {
+            console.error("Error processing image:", error);
+            message.reply("I had trouble seeing that image. Please try sending it again.");
+            return;
+        }
+    } else if (message.hasMedia && (message.type === 'ptt' || message.type === 'audio')) {
+        try {
+            console.log("Received voice message, transcribing...");
+            const media = await message.downloadMedia();
+            const audioBuffer = Buffer.from(media.data, 'base64');
+            const tempFilePath = `./temp_audio_${Date.now()}.ogg`;
+            await fs.writeFile(tempFilePath, audioBuffer);
+
+            const transcription = await openai.audio.transcriptions.create({
+                file: fsSync.createReadStream(tempFilePath),
+                model: "whisper-1",
+            });
+
+            await fs.unlink(tempFilePath);
+            messageBody = transcription.text;
+            console.log(`Transcription result: "${messageBody}"`);
+            userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
+        } catch (error) {
+            console.error("Error transcribing audio:", error);
+            message.reply("I couldn't understand the audio message. Please try again.");
+            return;
+        }
+    } else {
+        userHistoryEntry = { role: "user", type: 'text', content: messageBody };
+    }
+
+    if (messageBody.toLowerCase() === '!reset') {
         delete conversationHistories[message.from];
-        await saveHistory(); // Save after reset
+        await saveHistory();
         console.log(`History for ${message.from} has been reset.`);
         message.reply("I've cleared our previous conversation. Let's start fresh.");
         return;
     }
 
     try {
-        const history = conversationHistories[message.from] || [];
-        history.push({ role: "user", content: message.body });
+        history.push(userHistoryEntry);
 
         const aiResponse = await getOpenAIResponse(history);
-        history.push({ role: "assistant", content: aiResponse });
+        history.push({ role: "assistant", type: 'text', content: aiResponse });
 
         conversationHistories[message.from] = history;
         message.reply(aiResponse);
-        await saveHistory(); // Save after each message
+        await saveHistory();
 
         if (await isRequestCreationConfirmation(aiResponse)) {
             await handleServiceRequest(message.from, history);
@@ -120,7 +166,7 @@ client.on('message', async message => {
         if (history.length > MAX_HISTORY_LENGTH) {
             console.log(`History for ${message.from} exceeds limit. Triggering summarization.`);
             await summarizeHistory(message.from);
-            await saveHistory(); // Save again after summarization
+            await saveHistory();
         }
 
     } catch (error) {
@@ -139,12 +185,17 @@ start();
 
 // --- CORE AI FUNCTIONS ---
 
-async function getOpenAIResponse(messages) {
+async function getOpenAIResponse(richHistory) {
     try {
+        const openAIMessages = richHistory.map(msg => ({
+            role: msg.role,
+            content: msg.content
+        }));
+
         const completion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
-            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
-            max_tokens: 300 // Slightly increased for the more capable model
+            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...openAIMessages],
+            max_tokens: 300
         });
         const response = completion.choices[0].message.content.trim();
         if (!response) throw new Error("Received empty response from OpenAI.");
@@ -162,13 +213,15 @@ async function summarizeHistory(chatId) {
     console.log(`Summarizing ${history.length} messages for chat ${chatId}...`);
     const summarizationMessages = [
         ...history,
-        { role: "user", content: SUMMARIZATION_PROMPT }
+        { role: "user", type: 'text', content: SUMMARIZATION_PROMPT }
     ];
 
     try {
         const summaryResponse = await getOpenAIResponse(summarizationMessages);
+        const recentHistory = history.slice(-5); 
         conversationHistories[chatId] = [
-            { role: "system", content: `Summary of previous conversation: ${summaryResponse}` }
+            { role: "system", type: 'text', content: `Summary of previous conversation: ${summaryResponse}` },
+            ...recentHistory
         ];
         console.log(`Summarization complete for ${chatId}.`);
     } catch (error) {
@@ -205,7 +258,7 @@ async function handleServiceRequest(chatId, history) {
     try {
         const extractionCompletion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
-            messages: [...history, { role: "user", content: REQUEST_EXTRACTION_PROMPT }],
+            messages: [...history.map(m => ({role: m.role, content: m.content})), { role: "user", content: REQUEST_EXTRACTION_PROMPT }],
             response_format: { type: "json_object" },
         });
         const extractedData = JSON.parse(extractionCompletion.choices[0].message.content);
@@ -223,14 +276,33 @@ async function handleServiceRequest(chatId, history) {
 
             const detailedIssueCompletion = await openai.chat.completions.create({
                 model: OPENAI_MODEL,
-                messages: [...history, { role: "user", content: DETAILED_ISSUE_PROMPT }],
+                messages: [...history.map(m => ({role: m.role, content: m.content})), { role: "user", content: DETAILED_ISSUE_PROMPT }],
                 max_tokens: 150
             });
             const detailedIssue = detailedIssueCompletion.choices[0].message.content.trim();
 
             const requestMessage = `🆕 Новая заявка от жильца\n\n📞 Телефон: ${phone}\n📍 Адрес: ${address}\n❗️ Проблема: ${issueSummary}\n\n📝 Описание:\n${detailedIssue}`;
             await client.sendMessage(WORK_GROUP_ID, requestMessage);
-            console.log(`Service request from ${chatId} sent to work group.`);
+            console.log(`Service request text from ${chatId} sent to work group.`);
+
+            for (const msg of history) {
+                if (msg.role === 'user' && msg.media && !msg.forwarded) {
+                    try {
+                        const media = new MessageMedia(msg.media.mimetype, msg.media.data);
+                        let caption = 'Attached media file from user.';
+                        if (msg.type === 'image') {
+                        } else if (msg.type === 'audio') {
+                            caption = `User-submitted voice message. Transcription: "${msg.content}"`;
+                        }
+                        await client.sendMessage(WORK_GROUP_ID, media, { caption });
+                        console.log(`Forwarded ${msg.type} from ${chatId} to work group.`);
+                        msg.forwarded = true;
+                    } catch (e) {
+                        console.error(`Failed to forward media from ${chatId} to work group:`, e);
+                    }
+                }
+            }
+
         } else {
             console.log(`Incomplete information for service request from ${chatId}. The bot will ask for more details.`);
         }
@@ -238,4 +310,3 @@ async function handleServiceRequest(chatId, history) {
         console.error(`Error handling service request for ${chatId}:`, error);
     }
 }
-
