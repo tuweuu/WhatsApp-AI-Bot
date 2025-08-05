@@ -3,6 +3,7 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const { OpenAI } = require("openai");
 const fs = require('fs').promises;
 const fsSync = require('fs');
+const pdf = require('pdf-parse');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
@@ -18,7 +19,7 @@ const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description 
 const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a two-three words  **in Russian**.";
 const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a concise description of the user's issue **in Russian**, under 50 words.";
 
-const SYSTEM_PROMPT = `Ты - Кристина, администратор УК "Прогресс".
+const SYSTEM_PROMPT = `Ты - Кристина, администратор УК \"Прогресс\".
 
 Твои задачи:
 - Консультировать по услугам, графику, контактам.
@@ -30,13 +31,13 @@ const SYSTEM_PROMPT = `Ты - Кристина, администратор УК 
 - График: Пн-Пт, 9:00-18:00.
 - Адрес: Ирчи Казака 31.
 - Офис: +78004445205.
-- Оплата: в офисе или через приложение УК «Прогресс».
+- Оплата: Переводом на номер: +79000501111, в офисе или через приложение УК «Прогресс».
   - iOS: https://apps.apple.com/app/id6738488843
   - Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
 
 Важно:
-- Будь профессиональной и четкой. Избегай излишней эмпатии и фраз вроде "Мы понимаем ваше расстройство".
-- Отвечай кратко и по делу.
+- Будь профессиональной и четкой. Избегай излишней эмпатии и фраз вроде \"Мы понимаем ваше расстройство\".
+- Отвечай кратко и по делу. Не предлагай свою помощь каждый раз. Если жильцу нужна помощь - он сам обратится.
 - Ссылки отправляй как обычный текст, без форматирования.
 - Говори только на русском.
 - Не придумывай, если не знаешь ответ.
@@ -80,6 +81,20 @@ async function loadHistory() {
     }
 }
 
+// --- PDF HANDLING FUNCTION ---
+async function handlePdf(media) {
+    try {
+        console.log("Received PDF, parsing text...");
+        const fileBuffer = Buffer.from(media.data, 'base64');
+        const data = await pdf(fileBuffer);
+        return `The user has sent a PDF. Here is the content: ${data.text}`;
+    } catch (error) {
+        console.error("Error parsing PDF:", error);
+        return "I had trouble reading that PDF file. Please try sending it again.";
+    }
+}
+
+
 // --- WHATSAPP CLIENT EVENTS ---
 client.on('qr', qr => {
     qrcode.generate(qr, { small: true });
@@ -101,45 +116,62 @@ client.on('message', async message => {
     let messageBody = message.body;
     let userHistoryEntry;
 
-    if (message.hasMedia && message.type === 'image') {
-        try {
-            console.log("Received image message, processing...");
-            const media = await message.downloadMedia();
-            const openAIContent = [
-                { type: 'text', text: message.body },
-                { type: 'image_url', image_url: { url: `data:${media.mimetype};base64,${media.data}` } }
-            ];
-            userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
-        } catch (error) {
-            console.error("Error processing image:", error);
-            message.reply("I had trouble seeing that image. Please try sending it again.");
-            return;
-        }
-    } else if (message.hasMedia && (message.type === 'ptt' || message.type === 'audio')) {
-        try {
-            console.log("Received voice message, transcribing...");
-            const media = await message.downloadMedia();
-            const audioBuffer = Buffer.from(media.data, 'base64');
-            const tempFilePath = `./temp_audio_${Date.now()}.ogg`;
-            await fs.writeFile(tempFilePath, audioBuffer);
+    if (message.hasMedia) {
+        const media = await message.downloadMedia();
+        if (media.mimetype === 'image/jpeg' || media.mimetype === 'image/png' || media.mimetype === 'image/webp') {
+             try {
+                console.log("Received image message, processing with OpenAI Vision...");
+                const openAIContent = [
+                    { type: 'text', text: message.body },
+                    { type: 'image_url', image_url: { url: `data:${media.mimetype};base64,${media.data}` } }
+                ];
+                userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
+            } catch (error) {
+                console.error("Error processing image:", error);
+                message.reply("I had trouble seeing that image. Please try sending it again.");
+                return;
+            }
+        } else if (media.mimetype === 'application/pdf') {
+            try {
+                console.log("Received PDF message, processing...");
+                messageBody = await handlePdf(media);
+                userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
+            } catch (error) {
+                console.error("Error processing PDF:", error);
+                message.reply("I had trouble reading that PDF. Please try sending it again.");
+                return;
+            }
+        } else if (media.mimetype === 'audio/ogg' || message.type === 'ptt' || message.type === 'audio') {
+            try {
+                console.log("Received voice message, transcribing...");
+                const audioBuffer = Buffer.from(media.data, 'base64');
+                const tempFilePath = `./temp_audio_${Date.now()}.ogg`;
+                await fs.writeFile(tempFilePath, audioBuffer);
 
-            const transcription = await openai.audio.transcriptions.create({
-                file: fsSync.createReadStream(tempFilePath),
-                model: "whisper-1",
-            });
+                const transcription = await openai.audio.transcriptions.create({
+                    file: fsSync.createReadStream(tempFilePath),
+                    model: "whisper-1",
+                });
 
-            await fs.unlink(tempFilePath);
-            messageBody = transcription.text;
-            console.log(`Transcription result: "${messageBody}"`);
-            userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
-        } catch (error) {
-            console.error("Error transcribing audio:", error);
-            message.reply("I couldn't understand the audio message. Please try again.");
+                await fs.unlink(tempFilePath);
+                messageBody = transcription.text;
+                console.log(`Transcription result: \"${messageBody}\"`);
+                userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
+            } catch (error) {
+                console.error("Error transcribing audio:", error);
+                message.reply("I couldn't understand the audio message. Please try again.");
+                return;
+            }
+        } else {
+            // Unsupported file type
+            console.log(`Received unsupported file type: ${media.mimetype}`);
+            message.reply("I can only analyze images, PDFs, and voice messages at the moment.");
             return;
         }
     } else {
         userHistoryEntry = { role: "user", type: 'text', content: messageBody };
     }
+
 
     if (messageBody.toLowerCase() === '!reset') {
         delete conversationHistories[message.from];
@@ -218,7 +250,7 @@ async function summarizeHistory(chatId) {
 
     try {
         const summaryResponse = await getOpenAIResponse(summarizationMessages);
-        const recentHistory = history.slice(-5); 
+        const recentHistory = history.slice(-5);
         conversationHistories[chatId] = [
             { role: "system", type: 'text', content: `Summary of previous conversation: ${summaryResponse}` },
             ...recentHistory
@@ -292,7 +324,7 @@ async function handleServiceRequest(chatId, history) {
                         let caption = 'Attached media file from user.';
                         if (msg.type === 'image') {
                         } else if (msg.type === 'audio') {
-                            caption = `User-submitted voice message. Transcription: "${msg.content}"`;
+                            caption = `User-submitted voice message. Transcription: \"${msg.content}\"`;
                         }
                         await client.sendMessage(WORK_GROUP_ID, media, { caption });
                         console.log(`Forwarded ${msg.type} from ${chatId} to work group.`);
