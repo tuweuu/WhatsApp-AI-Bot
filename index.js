@@ -4,6 +4,7 @@ const { OpenAI } = require("openai");
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const pdf = require('pdf-parse');
+const ExcelParser = require('./excel-parser');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
@@ -18,25 +19,35 @@ const REQUEST_CONFIRMATION_PROMPT = "Read the following message. Does it confirm
 const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
 const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a two-three words  **in Russian**.";
 const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a concise description of the user's issue **in Russian**, under 50 words.";
+const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
 
-const SYSTEM_PROMPT = `Ты - Кристина, администратор УК \"Прогресс\".
+const SYSTEM_PROMPT = `Ты - Кристина, администратор УК "Прогресс".
 
 Твои задачи:
 - Консультировать по услугам, графику, контактам.
 - Принимать заявки на ремонт: перед приемом заявки узнай как можно больше информации, например: проблема во всем доме или в одной квартире? уточни адрес и время, подтверди прием заявки.
 - Помогать с оплатой.
+- Предоставлять номера лицевых счетов жильцам для входа в приложение (нужны ФИО и точный адрес).
 - Фиксировать жалобы.
+
+КОГДА ЖИЛЕЦ ПРОСИТ ЛИЦЕВОЙ СЧЕТ:
+- Естественно попроси полное ФИО (фамилия, имя, отчество)
+- Попроси точный адрес (улица, дом, квартира)
+- Собирай информацию постепенно в ходе беседы
+- Когда у тебя есть полное ФИО и адрес, добавь в свой ответ слово LOOKUP_ACCOUNT чтобы система могла найти счет
+- Если предоставленная информация не подходит, вежливо попроси уточнить данные
+- При неудаче предложи обратиться в офис
 
 Справочная информация:
 - График: Пн-Пт, 9:00-18:00.
 - Адрес: Ирчи Казака 31.
 - Офис: +78004445205.
-- Оплата: Переводом на номер: +79000501111, в офисе или через приложение УК «Прогресс».
+- Оплата: Переводом на номер: +7 (900) 050 11 11, в офисе или через приложение УК «Прогресс».
   - iOS: https://apps.apple.com/app/id6738488843
   - Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
 
 Важно:
-- Будь профессиональной и четкой. Избегай излишней эмпатии и фраз вроде \"Мы понимаем ваше расстройство\".
+- Будь профессиональной и четкой. Избегай излишней эмпатии и фраз вроде \"Мы понимаем ваше расстройство\", но продолжай быть вежливой и на фразы "Спасибо" или "До свидания" - отвечай так же тепло.
 - Отвечай кратко и по делу. Не предлагай свою помощь каждый раз. Если жильцу нужна помощь - он сам обратится.
 - Ссылки отправляй как обычный текст, без форматирования.
 - Говори только на русском.
@@ -55,6 +66,7 @@ const client = new Client({
 });
 
 let conversationHistories = {};
+let excelParser = null;
 
 // --- PERSISTENCE FUNCTIONS ---
 async function saveHistory() {
@@ -185,11 +197,28 @@ client.on('message', async message => {
         history.push(userHistoryEntry);
 
         const aiResponse = await getOpenAIResponse(history);
-        history.push({ role: "assistant", type: 'text', content: aiResponse });
-
-        conversationHistories[message.from] = history;
-        message.reply(aiResponse);
-        await saveHistory();
+        
+        // Check if AI response indicates it wants to look up an account
+        if (aiResponse.includes('LOOKUP_ACCOUNT')) {
+            // Try to handle account lookup
+            const accountHandled = await handleAccountLookup(message.from, history);
+            if (accountHandled) {
+                conversationHistories[message.from] = history;
+                await saveHistory();
+                return;
+            }
+            // Remove the LOOKUP_ACCOUNT keyword from the response
+            const cleanedResponse = aiResponse.replace('LOOKUP_ACCOUNT', '').trim();
+            history.push({ role: "assistant", type: 'text', content: cleanedResponse });
+            conversationHistories[message.from] = history;
+            message.reply(cleanedResponse);
+            await saveHistory();
+        } else {
+            history.push({ role: "assistant", type: 'text', content: aiResponse });
+            conversationHistories[message.from] = history;
+            message.reply(aiResponse);
+            await saveHistory();
+        }
 
         if (await isRequestCreationConfirmation(aiResponse)) {
             await handleServiceRequest(message.from, history);
@@ -210,6 +239,13 @@ client.on('message', async message => {
 // --- STARTUP SEQUENCE ---
 async function start() {
     await loadHistory();
+    
+    // Initialize Excel parser
+    console.log('Initializing Excel parser...');
+    excelParser = new ExcelParser();
+    await excelParser.loadAllExcelFiles('./');
+    console.log('Excel parser initialized.');
+    
     client.initialize();
 }
 
@@ -340,5 +376,55 @@ async function handleServiceRequest(chatId, history) {
         }
     } catch (error) {
         console.error(`Error handling service request for ${chatId}:`, error);
+    }
+}
+
+// --- ACCOUNT LOOKUP FUNCTIONS ---
+
+
+
+async function handleAccountLookup(chatId, history) {
+    if (!excelParser) {
+        console.error("Excel parser is not initialized. Cannot perform account lookup.");
+        return false;
+    }
+
+    try {
+        const extractionCompletion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: ACCOUNT_EXTRACTION_PROMPT },
+                ...history.map(m => ({role: m.role, content: m.content}))
+            ],
+            response_format: { type: "json_object" },
+        });
+        const extractedData = JSON.parse(extractionCompletion.choices[0].message.content);
+
+        const { fullName, address } = extractedData;
+        const phone = `+${chatId.split('@')[0]}`;
+
+        if (fullName && address) {
+            console.log(`Looking up account for: ${fullName} at ${address}`);
+            const accountInfo = excelParser.findResidentAccount(fullName, address);
+            
+            if (accountInfo) {
+                const accountMessage = `🏠 Найден ваш лицевой счет:\n\n📋 Номер: ${accountInfo.accountNumber}\n👤 ФИО: ${accountInfo.fullName}\n🏠 Квартира: ${accountInfo.apartmentNumber}\n📍 Адрес: ${accountInfo.address}\n\nИспользуйте этот номер для входа в приложение УК "Прогресс".`;
+                await client.sendMessage(chatId, accountMessage);
+                // Add the account info to conversation history
+                history.push({ role: "assistant", type: 'text', content: accountMessage });
+                console.log(`Account info sent to ${chatId}: ${accountInfo.accountNumber}`);
+                return true;
+            } else {
+                // Account not found - let AI handle this to continue the conversation
+                console.log(`Account not found for ${chatId}: ${fullName} at ${address} - letting AI handle response`);
+                return false; // Let AI respond and potentially ask for corrections
+            }
+        } else {
+            console.log(`Incomplete information for account lookup from ${chatId}. Missing: ${!fullName ? 'fullName' : ''} ${!address ? 'address' : ''} - falling back to AI`);
+            return false; // Let AI handle asking for missing information
+        }
+    } catch (error) {
+        console.error(`Error handling account lookup for ${chatId}:`, error);
+        return false;
     }
 }
