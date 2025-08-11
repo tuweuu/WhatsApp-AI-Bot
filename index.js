@@ -6,6 +6,8 @@ const fsSync = require('fs');
 const pdf = require('pdf-parse');
 const ExcelParser = require('./excel-parser');
 const { Debouncer } = require('@tanstack/pacer');
+const ffmpeg = require('fluent-ffmpeg');
+const path = require('path');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
@@ -16,11 +18,13 @@ const HISTORY_FILE_PATH = './history.json';
 
 // --- WORK GROUP INTEGRATION ---
 const WORK_GROUP_ID = process.env.WORK_GROUP_ID || null;
+const ACCOUNTING_GROUP_ID = process.env.ACCOUNTING_GROUP_ID || null;
 const REQUEST_CONFIRMATION_PROMPT = "Read the following message. Does it confirm that a service request has been successfully created and all necessary information (like address and time) has been collected? Answer only with 'yes' or 'no'.";
 const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
 const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a two-three words  **in Russian**.";
-const DETAILED_ISSUE_PROMPT = "Based on the conversation history, generate a concise description of the user's issue **in Russian**, under 50 words.";
+const DETAILED_ISSUE_PROMPT = "Based on the last user request, generate a concise description of the user's issue **in Russian**, under 50 words.";
 const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
+const ACCOUNTING_DETECTION_PROMPT = "Analyze the following message and determine if it requires accounting department intervention. Answer 'yes' if the message contains: 1) Questions about specific debt amounts, balances, or payment details 2) Requests for documents (квитанция, справка, документы) 3) Disputes about charges or payments 4) Questions about calculations, recalculations, or payment history 5) Requests for account verification or balance checks 6) Complaints about incorrect billing. Answer 'yes' for messages asking about: долг, задолженность, баланс, сколько должен, переплата, расчет, перерасчет, оплата, счет, лицевой счет details. Answer only with 'yes' or 'no'.";
 
 const SYSTEM_PROMPT = `Ты - Кристина, администратор УК "Прогресс".
 
@@ -113,6 +117,69 @@ async function handlePdf(media) {
     }
 }
 
+// --- VIDEO HANDLING FUNCTION ---
+async function handleVideo(media) {
+    try {
+        console.log("Received video, extracting frames for analysis...");
+        const videoBuffer = Buffer.from(media.data, 'base64');
+        const tempVideoPath = `./temp_video_${Date.now()}.mp4`;
+        const framesDir = `./temp_frames_${Date.now()}`;
+        
+        // Save video to temporary file
+        await fs.writeFile(tempVideoPath, videoBuffer);
+        
+        // Create frames directory
+        await fs.mkdir(framesDir, { recursive: true });
+        
+        // Extract frames using ffmpeg (every 2 seconds to avoid too many frames)
+        await new Promise((resolve, reject) => {
+            ffmpeg(tempVideoPath)
+                .outputOptions([
+                    '-vf fps=0.5', // Extract 1 frame every 2 seconds
+                    '-vframes 10'   // Limit to 10 frames max
+                ])
+                .output(path.join(framesDir, 'frame_%03d.jpg'))
+                .on('end', resolve)
+                .on('error', reject)
+                .run();
+        });
+        
+        // Read extracted frames
+        const frameFiles = await fs.readdir(framesDir);
+        const base64Frames = [];
+        
+        for (const frameFile of frameFiles.sort()) {
+            if (frameFile.endsWith('.jpg')) {
+                const framePath = path.join(framesDir, frameFile);
+                const frameBuffer = await fs.readFile(framePath);
+                const base64Frame = frameBuffer.toString('base64');
+                base64Frames.push(base64Frame);
+            }
+        }
+        
+        // Clean up temporary files
+        await fs.unlink(tempVideoPath);
+        await fs.rm(framesDir, { recursive: true, force: true });
+        
+        console.log(`Extracted ${base64Frames.length} frames from video`);
+        
+        // Create OpenAI content with frames
+        const openAIContent = [
+            { type: 'text', text: 'Пользователь отправил видео. Проанализируй содержимое видео и опиши что на нем происходит. Отвечай на русском языке.' },
+            ...base64Frames.map(frame => ({
+                type: 'image_url',
+                image_url: { url: `data:image/jpeg;base64,${frame}` }
+            }))
+        ];
+        
+        return openAIContent;
+        
+    } catch (error) {
+        console.error("Error processing video:", error);
+        return "Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.";
+    }
+}
+
 // --- MESSAGE BATCHING FUNCTIONS ---
 async function processBatchedMessages(chatId) {
     const messages = messageBuffers[chatId];
@@ -130,6 +197,43 @@ async function processBatchedMessages(chatId) {
     }
     
     try {
+        // Check if any of the messages are accounting-related
+         // Only check after we have some conversation context (at least 2 user messages or explicit request)
+         const userMessages = history.filter(msg => msg.role === 'user');
+         const lastUserMessage = messages[messages.length - 1].userHistoryEntry;
+         const messageContent = typeof lastUserMessage.content === 'string' 
+             ? lastUserMessage.content 
+             : lastUserMessage.content[0]?.text || '';
+             
+         // Check if this is an accounting request using AI analysis only
+         const hasEnoughContext = userMessages.length >= 2;
+         
+         if (hasEnoughContext && await isAccountingRequest(messageContent)) {
+             console.log(`Accounting request detected from ${chatId}`);
+             await handleAccountingRequest(chatId, history);
+             
+             // Let AI generate a natural confirmation response
+             history.push({ role: "system", type: 'text', content: "The user's accounting request has been successfully forwarded to the accounting department. Provide a natural, helpful confirmation message in Russian." });
+             
+             const aiResponse = await getOpenAIResponse(history);
+             
+             // Remove the system message
+             history.pop();
+             
+             // Add AI response to history and reply to user
+             history.push({ role: "assistant", type: 'text', content: aiResponse });
+             const lastMessage = messages[messages.length - 1].originalMessage;
+             lastMessage.reply(aiResponse);
+             
+             // Update conversation history and save
+             conversationHistories[chatId] = history;
+             await saveHistory();
+             
+             // Clear the buffer
+             messageBuffers[chatId] = [];
+             return;
+         }
+        
         // Create a combined context for the AI that mentions multiple messages
         const combinedContext = messages.length > 1 
             ? `The user has sent ${messages.length} messages in sequence. Please analyze them as a whole and provide a comprehensive response.`
@@ -190,7 +294,7 @@ async function processBatchedMessages(chatId) {
         console.error("Error processing batched messages:", error);
         // Reply to the last message in the batch with error
         const lastMessage = messages[messages.length - 1].originalMessage;
-        lastMessage.reply("I'm having some trouble right now. Please try again.");
+        lastMessage.reply("Проблемы с WhatsApp. Просим обратиться по номеру: +7 (800) 444-52-05");
     }
     
     // Clear the buffer after processing
@@ -256,7 +360,7 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
                 } catch (error) {
                     console.error("Error processing image:", error);
-                    message.reply("I had trouble seeing that image. Please try sending it again.");
+                    message.reply("Сейчас не могу открыть фото. Пожалуйста, напишите.");
                     return;
                 }
             } else if (media.mimetype === 'application/pdf') {
@@ -266,7 +370,7 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
                 } catch (error) {
                     console.error("Error processing PDF:", error);
-                    message.reply("I had trouble reading that PDF. Please try sending it again.");
+                    message.reply("Сейчас не могу открыть файл. Пожалуйста, напишите.");
                     return;
                 }
             } else if (media.mimetype === 'audio/ogg' || message.type === 'ptt' || message.type === 'audio') {
@@ -287,13 +391,28 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
                 } catch (error) {
                     console.error("Error transcribing audio:", error);
-                    message.reply("I couldn't understand the audio message. Please try again.");
+                    message.reply("Не разобрала ваше голосовое. Пожалуйста, напишите.");
+                    return;
+                }
+            } else if (media.mimetype === 'video/mp4' || media.mimetype === 'video/quicktime' || media.mimetype === 'video/avi' || media.mimetype === 'video/mov' || media.mimetype === 'video/webm') {
+                try {
+                    console.log("Received video message, processing and adding to batch...");
+                    const openAIContent = await handleVideo(media);
+                    if (typeof openAIContent === 'string') {
+                        // Error case
+                        message.reply(openAIContent);
+                        return;
+                    }
+                    userHistoryEntry = { role: "user", type: 'video', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
+                } catch (error) {
+                    console.error("Error processing video:", error);
+                    message.reply("Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.");
                     return;
                 }
             } else {
                 // Unsupported file type - handle immediately
                 console.log(`Received unsupported file type: ${media.mimetype}`);
-                message.reply("I can only analyze images, PDFs, and voice messages at the moment.");
+                message.reply("Не могу сейчас открыть ваше вложение. Пожалуйста, напишите.");
                 return;
             }
         } else {
@@ -320,7 +439,7 @@ client.on('message', async message => {
 
     } catch (error) {
         console.error("Error handling message:", error);
-        message.reply("I'm having some trouble right now. Please try again.");
+        message.reply("Не могу почему то открыть сообщение. Напишите пожалуйста.");
     }
 });
 
@@ -382,6 +501,92 @@ async function summarizeHistory(chatId) {
         console.log(`Summarization complete for ${chatId}.`);
     } catch (error) {
         console.error(`Failed to summarize history for ${chatId}:`, error);
+    }
+}
+
+// --- ACCOUNTING REQUEST FUNCTIONS ---
+
+async function isAccountingRequest(messageContent) {
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [{
+                role: "user",
+                content: `${ACCOUNTING_DETECTION_PROMPT}\n\n${messageContent}`
+            }],
+            max_tokens: 10
+        });
+        const response = completion.choices[0].message.content.trim().toLowerCase();
+        return response.includes('yes');
+    } catch (error) {
+        console.error("Error detecting accounting request:", error);
+        return false;
+    }
+}
+
+async function handleAccountingRequest(chatId, history) {
+    if (!ACCOUNTING_GROUP_ID) {
+        console.error("ACCOUNTING_GROUP_ID is not set in the .env file. Cannot send accounting request.");
+        return;
+    }
+
+    try {
+        const phone = `+${chatId.split('@')[0]}`;
+        
+        // Get conversation context for better understanding
+        const conversationText = history
+            .filter(msg => msg.role === 'user')
+            .map(msg => typeof msg.content === 'string' ? msg.content : msg.content[0]?.text || '')
+            .join(' ');
+        
+        // Use AI to extract reason and details
+        const extractionPrompt = `Analyze this accounting request and extract: 1) Brief reason (2-3 words) 2) Detailed information. Text: "${conversationText}". Return JSON with keys: "reason", "details" in russian.`;
+        
+        let reason = 'Бухгалтерский запрос';
+        let details = conversationText;
+        
+        try {
+            const completion = await openai.chat.completions.create({
+                model: OPENAI_MODEL,
+                messages: [{ role: "user", content: extractionPrompt }],
+                max_tokens: 200
+            });
+            
+            const extracted = JSON.parse(completion.choices[0].message.content);
+            reason = extracted.reason || reason;
+            details = extracted.details || details;
+        } catch (e) {
+            console.log('Failed to extract structured info, using fallback');
+        }
+        
+        const accountingMessage = `💰 Запрос в бухгалтерию\n\n📞 Телефон: ${phone}\n🏷️ Причина: ${reason}\n📝 Подробности: ${details}`;
+        await client.sendMessage(ACCOUNTING_GROUP_ID, accountingMessage);
+        console.log(`Accounting request from ${chatId} sent to accounting group.`);
+
+        // Forward any media files from the conversation
+        for (const msg of history) {
+            if (msg.role === 'user' && msg.media && !msg.forwarded) {
+                try {
+                    const media = new MessageMedia(msg.media.mimetype, msg.media.data);
+                    let caption = 'Приложенный файл от жильца.';
+                    if (msg.type === 'image') {
+                        caption = 'Изображение от жильца.';
+                    } else if (msg.type === 'audio') {
+                        caption = `Голосовое сообщение от жильца. Расшифровка: "${msg.content}"`;
+                    } else if (msg.type === 'file') {
+                        caption = `Документ от жильца: ${msg.media.filename || 'файл'}`;
+                    }
+                    await client.sendMessage(ACCOUNTING_GROUP_ID, media, { caption });
+                    console.log(`Forwarded ${msg.type} from ${chatId} to accounting group.`);
+                    msg.forwarded = true;
+                } catch (e) {
+                    console.error(`Failed to forward media from ${chatId} to accounting group:`, e);
+                }
+            }
+        }
+
+    } catch (error) {
+        console.error(`Error handling accounting request for ${chatId}:`, error);
     }
 }
 
