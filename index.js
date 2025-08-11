@@ -5,6 +5,7 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const pdf = require('pdf-parse');
 const ExcelParser = require('./excel-parser');
+const { Debouncer } = require('@tanstack/pacer');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
@@ -41,7 +42,8 @@ const SYSTEM_PROMPT = `Ты - Кристина, администратор УК 
 Справочная информация:
 - График: Пн-Пт, 9:00-18:00.
 - Адрес: Ирчи Казака 31.
-- Офис: +78004445205.
+- Офис: +7 (800) 444-52-05.
+- Контакты юриста: +7 (929) 867-91-90.
 - Оплата: Переводом на номер: +7 (900) 050 11 11, в офисе или через приложение УК «Прогресс».
   - iOS: https://apps.apple.com/app/id6738488843
   - Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
@@ -67,6 +69,11 @@ const client = new Client({
 
 let conversationHistories = {};
 let excelParser = null;
+
+// --- MESSAGE DEBOUNCING ---
+const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
+let messageBuffers = {}; // Store pending messages for each chat
+let messageDebouncers = {}; // Store debouncer instances for each chat
 
 // --- PERSISTENCE FUNCTIONS ---
 async function saveHistory() {
@@ -106,6 +113,100 @@ async function handlePdf(media) {
     }
 }
 
+// --- MESSAGE BATCHING FUNCTIONS ---
+async function processBatchedMessages(chatId) {
+    const messages = messageBuffers[chatId];
+    if (!messages || messages.length === 0) {
+        return;
+    }
+
+    console.log(`Processing ${messages.length} batched messages for ${chatId}`);
+    
+    const history = conversationHistories[chatId] || [];
+    
+    // Add all buffered messages to history
+    for (const messageData of messages) {
+        history.push(messageData.userHistoryEntry);
+    }
+    
+    try {
+        // Create a combined context for the AI that mentions multiple messages
+        const combinedContext = messages.length > 1 
+            ? `The user has sent ${messages.length} messages in sequence. Please analyze them as a whole and provide a comprehensive response.`
+            : '';
+        
+        // Add context if multiple messages
+        if (combinedContext) {
+            history.push({ role: "system", type: 'text', content: combinedContext });
+        }
+        
+        const aiResponse = await getOpenAIResponse(history);
+        
+        // Remove the system context message if we added one
+        if (combinedContext) {
+            history.pop();
+        }
+        
+        // Check if AI response indicates it wants to look up an account
+        if (aiResponse.includes('LOOKUP_ACCOUNT')) {
+            const accountHandled = await handleAccountLookup(chatId, history);
+            if (accountHandled) {
+                conversationHistories[chatId] = history;
+                await saveHistory();
+                // Clear the buffer
+                messageBuffers[chatId] = [];
+                return;
+            }
+            // Remove the LOOKUP_ACCOUNT keyword from the response
+            const cleanedResponse = aiResponse.replace('LOOKUP_ACCOUNT', '').trim();
+            history.push({ role: "assistant", type: 'text', content: cleanedResponse });
+            conversationHistories[chatId] = history;
+            
+            // Reply to the last message in the batch
+            const lastMessage = messages[messages.length - 1].originalMessage;
+            lastMessage.reply(cleanedResponse);
+            await saveHistory();
+        } else {
+            history.push({ role: "assistant", type: 'text', content: aiResponse });
+            conversationHistories[chatId] = history;
+            
+            // Reply to the last message in the batch
+            const lastMessage = messages[messages.length - 1].originalMessage;
+            lastMessage.reply(aiResponse);
+            await saveHistory();
+        }
+
+        if (await isRequestCreationConfirmation(aiResponse)) {
+            await handleServiceRequest(chatId, history);
+        }
+
+        if (history.length > MAX_HISTORY_LENGTH) {
+            console.log(`History for ${chatId} exceeds limit. Triggering summarization.`);
+            await summarizeHistory(chatId);
+            await saveHistory();
+        }
+
+    } catch (error) {
+        console.error("Error processing batched messages:", error);
+        // Reply to the last message in the batch with error
+        const lastMessage = messages[messages.length - 1].originalMessage;
+        lastMessage.reply("I'm having some trouble right now. Please try again.");
+    }
+    
+    // Clear the buffer after processing
+    messageBuffers[chatId] = [];
+}
+
+function getOrCreateDebouncer(chatId) {
+    if (!messageDebouncers[chatId]) {
+        messageDebouncers[chatId] = new Debouncer(
+            () => processBatchedMessages(chatId),
+            { wait: MESSAGE_DEBOUNCE_WAIT }
+        );
+    }
+    return messageDebouncers[chatId];
+}
+
 
 // --- WHATSAPP CLIENT EVENTS ---
 client.on('qr', qr => {
@@ -124,69 +225,17 @@ client.on('message', async message => {
 
     if (message.isStatus) return;
 
-    const history = conversationHistories[message.from] || [];
     let messageBody = message.body;
     let userHistoryEntry;
 
-    if (message.hasMedia) {
-        const media = await message.downloadMedia();
-        if (media.mimetype === 'image/jpeg' || media.mimetype === 'image/png' || media.mimetype === 'image/webp') {
-             try {
-                console.log("Received image message, processing with OpenAI Vision...");
-                const openAIContent = [
-                    { type: 'text', text: message.body },
-                    { type: 'image_url', image_url: { url: `data:${media.mimetype};base64,${media.data}` } }
-                ];
-                userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
-            } catch (error) {
-                console.error("Error processing image:", error);
-                message.reply("I had trouble seeing that image. Please try sending it again.");
-                return;
-            }
-        } else if (media.mimetype === 'application/pdf') {
-            try {
-                console.log("Received PDF message, processing...");
-                messageBody = await handlePdf(media);
-                userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
-            } catch (error) {
-                console.error("Error processing PDF:", error);
-                message.reply("I had trouble reading that PDF. Please try sending it again.");
-                return;
-            }
-        } else if (media.mimetype === 'audio/ogg' || message.type === 'ptt' || message.type === 'audio') {
-            try {
-                console.log("Received voice message, transcribing...");
-                const audioBuffer = Buffer.from(media.data, 'base64');
-                const tempFilePath = `./temp_audio_${Date.now()}.ogg`;
-                await fs.writeFile(tempFilePath, audioBuffer);
-
-                const transcription = await openai.audio.transcriptions.create({
-                    file: fsSync.createReadStream(tempFilePath),
-                    model: "whisper-1",
-                });
-
-                await fs.unlink(tempFilePath);
-                messageBody = transcription.text;
-                console.log(`Transcription result: \"${messageBody}\"`);
-                userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
-            } catch (error) {
-                console.error("Error transcribing audio:", error);
-                message.reply("I couldn't understand the audio message. Please try again.");
-                return;
-            }
-        } else {
-            // Unsupported file type
-            console.log(`Received unsupported file type: ${media.mimetype}`);
-            message.reply("I can only analyze images, PDFs, and voice messages at the moment.");
-            return;
-        }
-    } else {
-        userHistoryEntry = { role: "user", type: 'text', content: messageBody };
-    }
-
-
+    // Handle special commands immediately (no debouncing)
     if (messageBody.toLowerCase() === '!reset') {
         delete conversationHistories[message.from];
+        // Also clear any pending messages and cancel debouncer
+        messageBuffers[message.from] = [];
+        if (messageDebouncers[message.from]) {
+            messageDebouncers[message.from].cancel();
+        }
         await saveHistory();
         console.log(`History for ${message.from} has been reset.`);
         message.reply("I've cleared our previous conversation. Let's start fresh.");
@@ -194,44 +243,83 @@ client.on('message', async message => {
     }
 
     try {
-        history.push(userHistoryEntry);
+        // Process media and create user history entry
+        if (message.hasMedia) {
+            const media = await message.downloadMedia();
+            if (media.mimetype === 'image/jpeg' || media.mimetype === 'image/png' || media.mimetype === 'image/webp') {
+                try {
+                    console.log("Received image message, adding to batch...");
+                    const openAIContent = [
+                        { type: 'text', text: message.body },
+                        { type: 'image_url', image_url: { url: `data:${media.mimetype};base64,${media.data}` } }
+                    ];
+                    userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
+                } catch (error) {
+                    console.error("Error processing image:", error);
+                    message.reply("I had trouble seeing that image. Please try sending it again.");
+                    return;
+                }
+            } else if (media.mimetype === 'application/pdf') {
+                try {
+                    console.log("Received PDF message, adding to batch...");
+                    messageBody = await handlePdf(media);
+                    userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
+                } catch (error) {
+                    console.error("Error processing PDF:", error);
+                    message.reply("I had trouble reading that PDF. Please try sending it again.");
+                    return;
+                }
+            } else if (media.mimetype === 'audio/ogg' || message.type === 'ptt' || message.type === 'audio') {
+                try {
+                    console.log("Received voice message, transcribing and adding to batch...");
+                    const audioBuffer = Buffer.from(media.data, 'base64');
+                    const tempFilePath = `./temp_audio_${Date.now()}.ogg`;
+                    await fs.writeFile(tempFilePath, audioBuffer);
 
-        const aiResponse = await getOpenAIResponse(history);
-        
-        // Check if AI response indicates it wants to look up an account
-        if (aiResponse.includes('LOOKUP_ACCOUNT')) {
-            // Try to handle account lookup
-            const accountHandled = await handleAccountLookup(message.from, history);
-            if (accountHandled) {
-                conversationHistories[message.from] = history;
-                await saveHistory();
+                    const transcription = await openai.audio.transcriptions.create({
+                        file: fsSync.createReadStream(tempFilePath),
+                        model: "whisper-1",
+                    });
+
+                    await fs.unlink(tempFilePath);
+                    messageBody = transcription.text;
+                    console.log(`Transcription result: \"${messageBody}\"`);
+                    userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
+                } catch (error) {
+                    console.error("Error transcribing audio:", error);
+                    message.reply("I couldn't understand the audio message. Please try again.");
+                    return;
+                }
+            } else {
+                // Unsupported file type - handle immediately
+                console.log(`Received unsupported file type: ${media.mimetype}`);
+                message.reply("I can only analyze images, PDFs, and voice messages at the moment.");
                 return;
             }
-            // Remove the LOOKUP_ACCOUNT keyword from the response
-            const cleanedResponse = aiResponse.replace('LOOKUP_ACCOUNT', '').trim();
-            history.push({ role: "assistant", type: 'text', content: cleanedResponse });
-            conversationHistories[message.from] = history;
-            message.reply(cleanedResponse);
-            await saveHistory();
         } else {
-            history.push({ role: "assistant", type: 'text', content: aiResponse });
-            conversationHistories[message.from] = history;
-            message.reply(aiResponse);
-            await saveHistory();
+            userHistoryEntry = { role: "user", type: 'text', content: messageBody };
         }
 
-        if (await isRequestCreationConfirmation(aiResponse)) {
-            await handleServiceRequest(message.from, history);
+        // Initialize message buffer for this chat if it doesn't exist
+        if (!messageBuffers[message.from]) {
+            messageBuffers[message.from] = [];
         }
 
-        if (history.length > MAX_HISTORY_LENGTH) {
-            console.log(`History for ${message.from} exceeds limit. Triggering summarization.`);
-            await summarizeHistory(message.from);
-            await saveHistory();
-        }
+        // Add message to buffer
+        messageBuffers[message.from].push({
+            userHistoryEntry,
+            originalMessage: message,
+            timestamp: Date.now()
+        });
+
+        console.log(`Message from ${message.from} added to batch (${messageBuffers[message.from].length} messages pending)`);
+
+        // Get or create debouncer for this chat and trigger it
+        const debouncer = getOrCreateDebouncer(message.from);
+        debouncer.maybeExecute();
 
     } catch (error) {
-        console.error("Error processing message:", error);
+        console.error("Error handling message:", error);
         message.reply("I'm having some trouble right now. Please try again.");
     }
 });
