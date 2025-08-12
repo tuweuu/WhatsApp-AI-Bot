@@ -15,6 +15,10 @@ const OPENAI_MODEL = "gpt-4.1";
 const MAX_HISTORY_LENGTH = 20;
 const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
 const HISTORY_FILE_PATH = './history.json';
+const SERVICE_REQUESTS_FILE_PATH = './service-requests.json';
+// Dedup considers only requests within this time window
+const SERVICE_REQUEST_DUP_WINDOW_HOURS = Number(process.env.SERVICE_REQUEST_DUP_WINDOW_HOURS || 24);
+const SERVICE_REQUEST_DUP_WINDOW_MS = SERVICE_REQUEST_DUP_WINDOW_HOURS * 60 * 60 * 1000;
 
 // --- WORK GROUP INTEGRATION ---
 const WORK_GROUP_ID = process.env.WORK_GROUP_ID || null;
@@ -22,7 +26,7 @@ const ACCOUNTING_GROUP_ID = process.env.ACCOUNTING_GROUP_ID || null;
 const REQUEST_CONFIRMATION_PROMPT = "Read the following message. Does it confirm that a service request has been successfully created and all necessary information (like address and time) has been collected? Answer only with 'yes' or 'no'.";
 const REQUEST_EXTRACTION_PROMPT = "Extract the user's address and a description of the issue from the conversation. Return the data in JSON format with the keys: 'address', and 'issue'. If any information is missing, use the value 'null'.";
 const ISSUE_SUMMARY_PROMPT = "Summarize the following issue in a two-three words  **in Russian**.";
-const DETAILED_ISSUE_PROMPT = "Based on the last user request, generate a concise description of the user's issue **in Russian**, under 50 words.";
+const DETAILED_ISSUE_PROMPT = "Based on the LAST user request, generate a concise description of the user's issue **in Russian**, under 50 words.";
 const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
 const ACCOUNTING_DETECTION_PROMPT = "Analyze the following message and determine if it requires accounting department intervention. Answer 'yes' if the message contains: 1) Questions about specific debt amounts, balances, or payment details 2) Requests for documents (квитанция, справка, документы) 3) Disputes about charges or payments 4) Questions about calculations, recalculations, or payment history 5) Requests for account verification or balance checks 6) Complaints about incorrect billing. Answer 'yes' for messages asking about: долг, задолженность, баланс, сколько должен, переплата, расчет, перерасчет, оплата, счет, лицевой счет details. Answer only with 'yes' or 'no'.";
 
@@ -40,7 +44,7 @@ const SYSTEM_PROMPT = `Ты - Кристина, администратор УК 
 - Фиксировать жалобы.
 
 КОГДА ЖИЛЕЦ ПРОСИТ ЛИЦЕВОЙ СЧЕТ:
-- Естественно попроси полное ФИО (фамилия, имя, отчество)
+- Естественно попроси полное ФИО (фамилия и имя достаточно)
 - Попроси точный адрес (улица, дом, квартира)
 - Собирай информацию постепенно в ходе беседы
 - Когда у тебя есть полное ФИО и адрес, добавь в свой ответ слово LOOKUP_ACCOUNT чтобы система могла найти счет
@@ -78,6 +82,7 @@ const client = new Client({
 let conversationHistories = {};
 let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
+let serviceRequestsState = {}; // { [chatId]: Array<{ addressNorm: string, issueNorm: string, addressRaw: string, issueSummaryRaw: string, createdAt: number }> }
 
 // --- MESSAGE DEBOUNCING ---
 const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
@@ -157,6 +162,171 @@ async function loadHistory() {
         } else {
             console.error("Error loading conversation history:", error);
         }
+    }
+}
+
+// --- SERVICE REQUESTS DEDUP STATE ---
+async function saveServiceRequestsState() {
+    try {
+        const data = JSON.stringify(serviceRequestsState, null, 2);
+        await fs.writeFile(SERVICE_REQUESTS_FILE_PATH, data, 'utf8');
+    } catch (e) {
+        console.error('Error saving service requests state:', e);
+    }
+}
+
+async function loadServiceRequestsState() {
+    try {
+        await fs.access(SERVICE_REQUESTS_FILE_PATH);
+        const data = await fs.readFile(SERVICE_REQUESTS_FILE_PATH, 'utf8');
+        serviceRequestsState = JSON.parse(data);
+        console.log('Successfully loaded service requests state.');
+    } catch (e) {
+        if (e.code === 'ENOENT') {
+            console.log('No service requests state file found. Starting with empty state.');
+            serviceRequestsState = {};
+        } else {
+            console.error('Error loading service requests state:', e);
+        }
+    }
+}
+
+function normalizeText(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[\s\n\r\t]+/g, ' ')
+        .trim();
+}
+
+function normalizeAddress(address) {
+    return normalizeText(address).replace(/[.,;:]/g, '');
+}
+
+function findDuplicateServiceRequest(chatId, address, issueSummary) {
+    const addressNorm = normalizeAddress(address);
+    const issueNorm = normalizeText(issueSummary);
+    const now = Date.now();
+    const cutoff = now - SERVICE_REQUEST_DUP_WINDOW_MS;
+    const entries = (serviceRequestsState[chatId] || []).filter(e => (e.createdAt || 0) >= cutoff);
+    return entries.find(e => e.addressNorm === addressNorm && e.issueNorm === issueNorm) || null;
+}
+
+function recordServiceRequest(chatId, address, issueSummary) {
+    const entry = {
+        addressNorm: normalizeAddress(address),
+        issueNorm: normalizeText(issueSummary),
+        addressRaw: address,
+        issueSummaryRaw: issueSummary,
+        createdAt: Date.now()
+    };
+    if (!serviceRequestsState[chatId]) serviceRequestsState[chatId] = [];
+    serviceRequestsState[chatId].push(entry);
+    saveServiceRequestsState();
+    return entry;
+}
+
+function getRecentUserMessages(history, limit = 5) {
+    const result = [];
+    for (let i = history.length - 1; i >= 0 && result.length < limit; i--) {
+        const msg = history[i];
+        if (msg.role !== 'user') continue;
+        if (typeof msg.content === 'string') {
+            if (msg.content.trim()) result.push(msg.content.trim());
+        } else if (Array.isArray(msg.content)) {
+            const textPart = msg.content.find(p => p.type === 'text');
+            if (textPart && textPart.text && textPart.text.trim()) result.push(textPart.text.trim());
+        }
+    }
+    return result.reverse();
+}
+
+async function isDuplicateRequestAI(chatId, address, issueSummary, issueFullText) {
+    try {
+        const cutoff = Date.now() - SERVICE_REQUEST_DUP_WINDOW_MS;
+        const previous = (serviceRequestsState[chatId] || []).filter(r => (r.createdAt || 0) >= cutoff).map((r, idx) => ({
+            index: idx,
+            address: r.addressRaw,
+            issue: r.issueSummaryRaw,
+            createdAt: r.createdAt
+        }));
+
+        // If nothing to compare, it's not a duplicate
+        if (previous.length === 0) return false;
+
+        const prompt = `Определи, является ли новая жалоба дубликатом одной из уже созданных заявок для этого жильца.
+Считай дубликатом, если адрес совпадает (допускай незначительные различия в записи) и описывается та же проблема, даже если формулировка отличается.
+Не считай дубликатом, если это явно новый отдельный случай или другая локация/узел в квартире/доме.
+
+Текущая жалоба:
+- Адрес: ${address}
+- Кратко: ${issueSummary}
+- Текст: ${issueFullText || ''}
+
+Созданные ранее заявки (по этому чату):
+${JSON.stringify(previous, null, 2)}
+
+Ответь строго JSON с ключами: { "duplicate": true|false }.`;
+
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [{ role: 'user', content: prompt }],
+            response_format: { type: 'json_object' },
+            max_tokens: 50
+        });
+        const parsed = JSON.parse(completion.choices[0].message.content || '{}');
+        return !!parsed.duplicate;
+    } catch (e) {
+        console.error('AI duplicate detection failed, falling back to non-duplicate:', e);
+        return false;
+    }
+}
+
+async function doesUserInsistNewRequestAI(history) {
+    try {
+        const recentUserTexts = getRecentUserMessages(history, 6);
+        const prompt = `Проанализируй последние сообщения жильца и ответь, просит ли он ЯВНО оформить ОТДЕЛЬНУЮ новую заявку, а не просто уточняет статус/подробности.
+Сообщения:
+${JSON.stringify(recentUserTexts, null, 2)}
+
+Ответь строго JSON: { "insist": true|false }.`;
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [{ role: 'user', content: prompt }],
+            response_format: { type: 'json_object' },
+            max_tokens: 30
+        });
+        const parsed = JSON.parse(completion.choices[0].message.content || '{}');
+        return !!parsed.insist;
+    } catch (e) {
+        console.error('AI insist detection failed, defaulting to not insisting:', e);
+        return false;
+    }
+}
+
+async function generateNaturalDuplicateReplyAI(history, address, issueSummary) {
+    try {
+        const recentUserTexts = getRecentUserMessages(history, 6);
+        const prompt = `Кратко и по-делу ответь жильцу на русском.
+Контекст: по этой проблеме уже есть активная заявка. Адрес: ${address}. Кратко о проблеме: ${issueSummary}.
+Задача ответа:
+- Сообщи естественно, что заявка уже в работе.
+- Предложи добавить новые детали, если появились (фото, время, уточнения).
+- Не используй штампованные формулировки.
+- Будь краткой.
+
+Недавние сообщения жильца:
+${JSON.stringify(recentUserTexts, null, 2)}
+`;
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 120
+        });
+        const text = (completion.choices[0].message.content || '').trim();
+        return text || 'Заявка уже в работе. Если появились новые детали, пришлите — обновлю. Нужна отдельная заявка — скажите.';
+    } catch (e) {
+        console.error('AI duplicate reply generation failed, using fallback:', e);
+        return 'Заявка уже в работе. Если появились новые детали, пришлите — обновлю. Нужна отдельная заявка — скажите.';
     }
 }
 
@@ -470,7 +640,7 @@ async function processBatchedMessages(chatId) {
         if (combinedContext) {
             history.pop();
         }
-        
+
         // Check if AI response indicates it wants to look up an account
         if (aiResponse.includes('LOOKUP_ACCOUNT')) {
             const accountHandled = await handleAccountLookup(chatId, history);
@@ -491,17 +661,27 @@ async function processBatchedMessages(chatId) {
             await sendReplyWithTyping(lastMessage, cleanedResponse);
             await saveHistory();
         } else {
-            history.push({ role: "assistant", type: 'text', content: aiResponse });
-            conversationHistories[chatId] = history;
-            
-            // Reply to the last message in the batch
-            const lastMessage = messages[messages.length - 1].originalMessage;
-            await sendReplyWithTyping(lastMessage, aiResponse);
-            await saveHistory();
-        }
-
-        if (await isRequestCreationConfirmation(aiResponse)) {
-            await handleServiceRequest(chatId, history);
+            // If this assistant message is a request confirmation, preflight duplicate logic
+            const isConfirm = await isRequestCreationConfirmation(aiResponse);
+            if (isConfirm) {
+                const decision = await preflightServiceRequestDecision(chatId, history);
+                const replyText = decision.allowCreate ? aiResponse : decision.replyText;
+                history.push({ role: "assistant", type: 'text', content: replyText });
+                conversationHistories[chatId] = history;
+                const lastMessage = messages[messages.length - 1].originalMessage;
+                await sendReplyWithTyping(lastMessage, replyText);
+                await saveHistory();
+                if (decision.allowCreate) {
+                    await handleServiceRequest(chatId, history);
+                }
+            } else {
+                // Normal reply
+                history.push({ role: "assistant", type: 'text', content: aiResponse });
+                conversationHistories[chatId] = history;
+                const lastMessage = messages[messages.length - 1].originalMessage;
+                await sendReplyWithTyping(lastMessage, aiResponse);
+                await saveHistory();
+            }
         }
 
         if (history.length > MAX_HISTORY_LENGTH) {
@@ -704,6 +884,7 @@ client.on('message', async message => {
 async function start() {
     await loadHistory();
     await loadAdminState();
+    await loadServiceRequestsState();
     
     // Initialize Excel parser
     console.log('Initializing Excel parser...');
@@ -868,6 +1049,49 @@ async function isRequestCreationConfirmation(messageContent) {
     }
 }
 
+async function preflightServiceRequestDecision(chatId, history) {
+    // Use the most recent extracted data to decide duplicate before we send acceptance
+    try {
+        const extractionCompletion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [...history.map(m => ({ role: m.role, content: m.content })), { role: 'user', content: REQUEST_EXTRACTION_PROMPT }],
+            response_format: { type: 'json_object' }
+        });
+        const extracted = JSON.parse(extractionCompletion.choices[0].message.content || '{}');
+        const { address, issue } = extracted;
+        if (!address || !issue) {
+            return { allowCreate: false, replyText: 'Нужны адрес и краткое описание проблемы, чтобы оформить заявку.', isDuplicate: false, insist: false };
+        }
+
+        const summaryCompletion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [{ role: 'user', content: `${ISSUE_SUMMARY_PROMPT}: ${issue}` }],
+            max_tokens: 10
+        });
+        const issueSummary = (summaryCompletion.choices[0].message.content || '').trim();
+
+        const duplicateRecord = findDuplicateServiceRequest(chatId, address, issueSummary);
+        let isDuplicate = false;
+        if (duplicateRecord) {
+            isDuplicate = true;
+        } else {
+            isDuplicate = await isDuplicateRequestAI(chatId, address, issueSummary, issue);
+        }
+
+        if (!isDuplicate) return { allowCreate: true, isDuplicate: false, insist: false };
+
+        const insist = await doesUserInsistNewRequestAI(history);
+        if (insist) return { allowCreate: true, isDuplicate: true, insist };
+
+        const naturalReply = await generateNaturalDuplicateReplyAI(history, address, issueSummary);
+        return { allowCreate: false, replyText: naturalReply, isDuplicate: true, insist: false };
+
+    } catch (e) {
+        console.error('preflightServiceRequestDecision failed, defaulting to allow:', e);
+        return { allowCreate: true, isDuplicate: false, insist: false };
+    }
+}
+
 async function handleServiceRequest(chatId, history) {
     if (!WORK_GROUP_ID) {
         console.error("WORK_GROUP_ID is not set in the .env file. Cannot send service request.");
@@ -886,12 +1110,37 @@ async function handleServiceRequest(chatId, history) {
         const phone = `+${chatId.split('@')[0]}`;
 
         if (address && issue) {
+            // Summarize issue first to use in deduplication key
             const summaryCompletion = await openai.chat.completions.create({
                 model: OPENAI_MODEL,
                 messages: [{ role: "user", content: `${ISSUE_SUMMARY_PROMPT}: ${issue}` }],
                 max_tokens: 10
             });
             const issueSummary = summaryCompletion.choices[0].message.content.trim();
+
+            // Duplicate prevention with AI reasoning
+            const duplicateRecord = findDuplicateServiceRequest(chatId, address, issueSummary);
+            let isDuplicate = false;
+            let insistNew = false;
+            if (duplicateRecord) {
+                isDuplicate = true;
+            } else {
+                // Ask AI if this appears to be a duplicate of previous requests for this chat
+                isDuplicate = await isDuplicateRequestAI(chatId, address, issueSummary, issue);
+            }
+
+            if (isDuplicate) {
+                // Ask AI if the user insists on a separate new request
+                insistNew = await doesUserInsistNewRequestAI(history);
+                if (!insistNew) {
+                    const naturalReply = await generateNaturalDuplicateReplyAI(history, address, issueSummary);
+                    await sendMessageWithTyping(chatId, naturalReply);
+                    history.push({ role: 'assistant', type: 'text', content: naturalReply });
+                    conversationHistories[chatId] = history;
+                    await saveHistory();
+                    return;
+                }
+            }
 
             const detailedIssueCompletion = await openai.chat.completions.create({
                 model: OPENAI_MODEL,
@@ -900,9 +1149,14 @@ async function handleServiceRequest(chatId, history) {
             });
             const detailedIssue = detailedIssueCompletion.choices[0].message.content.trim();
 
-            const requestMessage = `🆕 Новая заявка от жильца\n\n📞 Телефон: ${phone}\n📍 Адрес: ${address}\n❗️ Проблема: ${issueSummary}\n\n📝 Описание:\n${detailedIssue}`;
+            // Avoid sending two assistant messages back-to-back: if we got here via preflight (isDuplicate and not insistNew) we would have returned earlier.
+            const header = (isDuplicate && insistNew) ? '🆕 Повторная заявка от жильца' : '🆕 Новая заявка от жильца';
+            const requestMessage = `${header}\n\n📞 Телефон: ${phone}\n📍 Адрес: ${address}\n❗️ Проблема: ${issueSummary}\n\n📝 Описание:\n${detailedIssue}`;
             await client.sendMessage(WORK_GROUP_ID, requestMessage);
             console.log(`Service request text from ${chatId} sent to work group.`);
+
+            // Record to dedup state
+            recordServiceRequest(chatId, address, issueSummary);
 
             for (const msg of history) {
                 if (msg.role === 'user' && msg.media && !msg.forwarded) {
