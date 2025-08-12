@@ -75,9 +75,60 @@ let conversationHistories = {};
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
+
+// --- TYPING HELPERS (context7 timings) ---
+function calculateTypingDurationMs(text) {
+    const msPerChar = 70;
+    const minMs = 700;
+    const maxMs = 7000;
+    const length = typeof text === 'string' ? text.length : 0;
+    return Math.max(minMs, Math.min(maxMs, length * msPerChar));
+}
+
+async function showTypingForDuration(chat, durationMs) {
+    try {
+        if (!chat) return;
+        // Immediately show typing, then keep alive every ~2s
+        chat.sendStateTyping();
+        const intervalId = setInterval(() => {
+            chat.sendStateTyping();
+        }, 2000);
+        await new Promise(resolve => setTimeout(resolve, durationMs));
+        clearInterval(intervalId);
+        await chat.clearState();
+    } catch (e) {
+        // Ignore typing errors; proceed to send
+    }
+}
+
+async function sendReplyWithTyping(message, text) {
+    try {
+        const chat = await message.getChat();
+        if (chat && !chat.isGroup) {
+            const delayMs = calculateTypingDurationMs(text);
+            await showTypingForDuration(chat, delayMs);
+        }
+        await message.reply(text);
+    } catch (e) {
+        try { await message.reply(text); } catch (_) {}
+    }
+}
+
+async function sendMessageWithTyping(chatId, text) {
+    try {
+        const chat = await client.getChatById(chatId);
+        if (chat && !chat.isGroup) {
+            const delayMs = calculateTypingDurationMs(text);
+            await showTypingForDuration(chat, delayMs);
+        }
+        await client.sendMessage(chatId, text);
+    } catch (e) {
+        try { await client.sendMessage(chatId, text); } catch (_) {}
+    }
+}
 
 // --- PERSISTENCE FUNCTIONS ---
 async function saveHistory() {
@@ -223,7 +274,7 @@ async function processBatchedMessages(chatId) {
              // Add AI response to history and reply to user
              history.push({ role: "assistant", type: 'text', content: aiResponse });
              const lastMessage = messages[messages.length - 1].originalMessage;
-             lastMessage.reply(aiResponse);
+             await sendReplyWithTyping(lastMessage, aiResponse);
              
              // Update conversation history and save
              conversationHistories[chatId] = history;
@@ -268,7 +319,7 @@ async function processBatchedMessages(chatId) {
             
             // Reply to the last message in the batch
             const lastMessage = messages[messages.length - 1].originalMessage;
-            lastMessage.reply(cleanedResponse);
+            await sendReplyWithTyping(lastMessage, cleanedResponse);
             await saveHistory();
         } else {
             history.push({ role: "assistant", type: 'text', content: aiResponse });
@@ -276,7 +327,7 @@ async function processBatchedMessages(chatId) {
             
             // Reply to the last message in the batch
             const lastMessage = messages[messages.length - 1].originalMessage;
-            lastMessage.reply(aiResponse);
+            await sendReplyWithTyping(lastMessage, aiResponse);
             await saveHistory();
         }
 
@@ -294,7 +345,7 @@ async function processBatchedMessages(chatId) {
         console.error("Error processing batched messages:", error);
         // Reply to the last message in the batch with error
         const lastMessage = messages[messages.length - 1].originalMessage;
-        lastMessage.reply("Проблемы с WhatsApp. Просим обратиться по номеру: +7 (800) 444-52-05");
+        await sendReplyWithTyping(lastMessage, "Проблемы с WhatsApp. Просим обратиться по номеру: +7 (800) 444-52-05");
     }
     
     // Clear the buffer after processing
@@ -342,7 +393,7 @@ client.on('message', async message => {
         }
         await saveHistory();
         console.log(`History for ${message.from} has been reset.`);
-        message.reply("I've cleared our previous conversation. Let's start fresh.");
+        await sendReplyWithTyping(message, "I've cleared our previous conversation. Let's start fresh.");
         return;
     }
 
@@ -360,7 +411,7 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
                 } catch (error) {
                     console.error("Error processing image:", error);
-                    message.reply("Сейчас не могу открыть фото. Пожалуйста, напишите.");
+                    await sendReplyWithTyping(message, "Сейчас не могу открыть фото. Пожалуйста, напишите.");
                     return;
                 }
             } else if (media.mimetype === 'application/pdf') {
@@ -370,7 +421,7 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
                 } catch (error) {
                     console.error("Error processing PDF:", error);
-                    message.reply("Сейчас не могу открыть файл. Пожалуйста, напишите.");
+                    await sendReplyWithTyping(message, "Сейчас не могу открыть файл. Пожалуйста, напишите.");
                     return;
                 }
             } else if (media.mimetype === 'audio/ogg' || message.type === 'ptt' || message.type === 'audio') {
@@ -391,7 +442,7 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
                 } catch (error) {
                     console.error("Error transcribing audio:", error);
-                    message.reply("Не разобрала ваше голосовое. Пожалуйста, напишите.");
+                    await sendReplyWithTyping(message, "Не разобрала ваше голосовое. Пожалуйста, напишите.");
                     return;
                 }
             } else if (media.mimetype === 'video/mp4' || media.mimetype === 'video/quicktime' || media.mimetype === 'video/avi' || media.mimetype === 'video/mov' || media.mimetype === 'video/webm') {
@@ -400,19 +451,19 @@ client.on('message', async message => {
                     const openAIContent = await handleVideo(media);
                     if (typeof openAIContent === 'string') {
                         // Error case
-                        message.reply(openAIContent);
+                        await sendReplyWithTyping(message, openAIContent);
                         return;
                     }
                     userHistoryEntry = { role: "user", type: 'video', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
                 } catch (error) {
                     console.error("Error processing video:", error);
-                    message.reply("Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.");
+                    await sendReplyWithTyping(message, "Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.");
                     return;
                 }
             } else {
                 // Unsupported file type - handle immediately
                 console.log(`Received unsupported file type: ${media.mimetype}`);
-                message.reply("Не могу сейчас открыть ваше вложение. Пожалуйста, напишите.");
+                await sendReplyWithTyping(message, "Не могу сейчас открыть ваше вложение. Пожалуйста, напишите.");
                 return;
             }
         } else {
@@ -439,7 +490,7 @@ client.on('message', async message => {
 
     } catch (error) {
         console.error("Error handling message:", error);
-        message.reply("Не могу почему то открыть сообщение. Напишите пожалуйста.");
+        await sendReplyWithTyping(message, "Не могу почему то открыть сообщение. Напишите пожалуйста.");
     }
 });
 
@@ -702,7 +753,7 @@ async function handleAccountLookup(chatId, history) {
             
             if (accountInfo) {
                 const accountMessage = `🏠 Найден ваш лицевой счет:\n\n📋 Номер: ${accountInfo.accountNumber}\n👤 ФИО: ${accountInfo.fullName}\n🏠 Квартира: ${accountInfo.apartmentNumber}\n📍 Адрес: ${accountInfo.address}\n\nИспользуйте этот номер для входа в приложение УК "Прогресс".`;
-                await client.sendMessage(chatId, accountMessage);
+                await sendMessageWithTyping(chatId, accountMessage);
                 // Add the account info to conversation history
                 history.push({ role: "assistant", type: 'text', content: accountMessage });
                 console.log(`Account info sent to ${chatId}: ${accountInfo.accountNumber}`);
