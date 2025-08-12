@@ -26,6 +26,10 @@ const DETAILED_ISSUE_PROMPT = "Based on the last user request, generate a concis
 const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
 const ACCOUNTING_DETECTION_PROMPT = "Analyze the following message and determine if it requires accounting department intervention. Answer 'yes' if the message contains: 1) Questions about specific debt amounts, balances, or payment details 2) Requests for documents (квитанция, справка, документы) 3) Disputes about charges or payments 4) Questions about calculations, recalculations, or payment history 5) Requests for account verification or balance checks 6) Complaints about incorrect billing. Answer 'yes' for messages asking about: долг, задолженность, баланс, сколько должен, переплата, расчет, перерасчет, оплата, счет, лицевой счет details. Answer only with 'yes' or 'no'.";
 
+// --- ADMIN INTEGRATION ---
+const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID || null;
+const ADMIN_STATE_FILE_PATH = './admin-state.json';
+
 const SYSTEM_PROMPT = `Ты - Кристина, администратор УК "Прогресс".
 
 Твои задачи:
@@ -72,6 +76,7 @@ const client = new Client({
 });
 
 let conversationHistories = {};
+let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
@@ -152,6 +157,170 @@ async function loadHistory() {
         } else {
             console.error("Error loading conversation history:", error);
         }
+    }
+}
+
+// --- ADMIN STATE & COMMANDS ---
+function normalizePhone(phone) {
+    return String(phone || '').replace(/[^\d]/g, '');
+}
+
+function phoneToChatId(phone) {
+    const digits = normalizePhone(phone);
+    return digits ? `${digits}@c.us` : null;
+}
+
+function parseDuration(text) {
+    if (!text) return null;
+    const match = String(text).trim().match(/^(\d+)\s*(s|m|h|d)$/i);
+    if (!match) return null;
+    const amount = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+    const multiplier = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[unit];
+    return amount * multiplier;
+}
+
+async function saveAdminState() {
+    try {
+        await fs.writeFile(ADMIN_STATE_FILE_PATH, JSON.stringify({ mutedChats }, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Error saving admin state:', e);
+    }
+}
+
+async function loadAdminState() {
+    try {
+        await fs.access(ADMIN_STATE_FILE_PATH);
+        const data = await fs.readFile(ADMIN_STATE_FILE_PATH, 'utf8');
+        const parsed = JSON.parse(data);
+        mutedChats = parsed.mutedChats || {};
+        console.log('Successfully loaded admin state.');
+    } catch (e) {
+        if (e.code === 'ENOENT') {
+            console.log('No admin state file found. Starting with empty admin state.');
+        } else {
+            console.error('Error loading admin state:', e);
+        }
+    }
+}
+
+function isChatMuted(chatId) {
+    const entry = mutedChats[chatId];
+    if (!entry) return false;
+    if (entry.until && Date.now() > entry.until) {
+        delete mutedChats[chatId];
+        saveAdminState();
+        return false;
+    }
+    return true;
+}
+
+async function muteChat(chatId, durationMs) {
+    const until = durationMs ? Date.now() + durationMs : null;
+    mutedChats[chatId] = { until };
+    // Cancel any pending debounced processing and clear buffer
+    if (messageDebouncers[chatId]) {
+        try { messageDebouncers[chatId].cancel(); } catch (_) {}
+    }
+    messageBuffers[chatId] = [];
+    await saveAdminState();
+}
+
+async function unmuteChat(chatId) {
+    delete mutedChats[chatId];
+    await saveAdminState();
+}
+
+function formatMute(entry) {
+    if (!entry) return '🔔 Включен';
+    if (!entry.until) return '🔕 Отключен • бессрочно';
+    const remainingMs = entry.until - Date.now();
+    if (remainingMs <= 0) return '🔔 Включен';
+    return `🔕 Отключен • ещё ${formatDurationShort(remainingMs)} (до ${formatDateTime(entry.until)})`;
+}
+
+async function handleAdminCommand(message) {
+    const raw = (message.body || '').trim();
+    const [cmdRaw, phoneArg, durArg] = raw.split(/\s+/);
+    const cmd = (cmdRaw || '').toLowerCase();
+    const replyTarget = message.fromMe ? (message.to || message.from) : message.from;
+
+    if (cmd === '!mute') {
+        if (!phoneArg) { await client.sendMessage(replyTarget, 'Использование: !mute <телефон> [30m|2h|1d]'); return; }
+        const chatId = phoneToChatId(phoneArg);
+        if (!chatId) { await client.sendMessage(replyTarget, 'Некорректный телефон.'); return; }
+        const ms = parseDuration(durArg);
+        await muteChat(chatId, ms);
+        const untilTs = mutedChats[chatId].until;
+        const timeInfo = untilTs ? `до ${formatDateTime(untilTs)} (ещё ${formatDurationShort(untilTs - Date.now())})` : 'бессрочно';
+        await client.sendMessage(replyTarget, `✅ Отключила AI ответы для ${chatId}\n⏳ Срок: ${timeInfo}`);
+        return;
+    }
+    if (cmd === '!unmute') {
+        if (!phoneArg) { await client.sendMessage(replyTarget, 'Использование: !unmute <телефон>'); return; }
+        const chatId = phoneToChatId(phoneArg);
+        if (!chatId) { await client.sendMessage(replyTarget, 'Некорректный телефон.'); return; }
+        await unmuteChat(chatId);
+        await client.sendMessage(replyTarget, `✅ Включила AI ответы для ${chatId}`);
+        return;
+    }
+    if (cmd === '!status') {
+        cleanupExpiredMutes();
+        if (phoneArg) {
+            const chatId = phoneToChatId(phoneArg);
+            const state = mutedChats[chatId];
+            await client.sendMessage(replyTarget, `${chatId}: ${formatMute(state)}`);
+        } else {
+            const now = Date.now();
+            const entries = Object.entries(mutedChats).filter(([_, e]) => !e.until || e.until > now);
+            if (!entries.length) { await client.sendMessage(replyTarget, '✅ Сейчас нет отключенных чатов.'); return; }
+            const lines = entries.map(([id, e]) => `• ${id}: ${formatMute(e)}`);
+            await client.sendMessage(replyTarget, `🧾 Отключенные чаты (${entries.length}):\n${lines.join('\n')}`);
+        }
+        return;
+    }
+    if (cmd === '!help') {
+        await client.sendMessage(replyTarget, 'Команды:\n• !mute <телефон> [30m|2h|1d]\n• !unmute <телефон>\n• !status [телефон]');
+        return;
+    }
+    await client.sendMessage(replyTarget, 'Неизвестная команда. !help');
+}
+
+function cleanupExpiredMutes() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, e] of Object.entries(mutedChats)) {
+        if (e && e.until && now > e.until) {
+            delete mutedChats[id];
+            changed = true;
+        }
+    }
+    if (changed) {
+        saveAdminState();
+    }
+}
+
+function formatDurationShort(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (d > 0) {
+        if (h > 0) return `${d} д ${h} ч`;
+        return `${d} д`;
+    }
+    if (h > 0) {
+        if (m > 0) return `${h} ч ${m} мин`;
+        return `${h} ч`;
+    }
+    return `${Math.max(1, m)} мин`;
+}
+
+function formatDateTime(ts) {
+    try {
+        return new Date(ts).toLocaleString('ru-RU');
+    } catch (_) {
+        return new Date(ts).toLocaleString();
     }
 }
 
@@ -372,13 +541,41 @@ client.on('ready', () => {
     console.log('Client is ready!');
 });
 
+// Also process admin commands the bot sends itself in the admin group
+client.on('message_create', async (message) => {
+    try {
+        if (!ADMIN_GROUP_ID) return;
+        if (!message.fromMe) return;
+        const targetChatId = message.to || message.from;
+        const body = (message.body || '').trim();
+        if (targetChatId === ADMIN_GROUP_ID && body.startsWith('!')) {
+            await handleAdminCommand(message);
+        }
+    } catch (e) {
+        console.error('Admin self-command error:', e);
+    }
+});
+
 client.on('message', async message => {
+    if (message.isStatus) return;
+
+    // Route admin group commands before generic group handling
+    if (ADMIN_GROUP_ID && message.from === ADMIN_GROUP_ID) {
+        try {
+            const body = (message.body || '').trim();
+            if (body.startsWith('!')) {
+                await handleAdminCommand(message);
+            }
+        } catch (e) {
+            console.error('Admin command error:', e);
+        }
+        return;
+    }
+
     if (message.from.endsWith('@g.us')) {
         console.log(`Message received from group: ${message.from}`);
         return;
     }
-
-    if (message.isStatus) return;
 
     let messageBody = message.body;
     let userHistoryEntry;
@@ -470,6 +667,15 @@ client.on('message', async message => {
             userHistoryEntry = { role: "user", type: 'text', content: messageBody };
         }
 
+        // If chat is muted, store to history and do not reply/buffer
+        if (isChatMuted(message.from)) {
+            const history = conversationHistories[message.from] || [];
+            history.push(userHistoryEntry);
+            conversationHistories[message.from] = history;
+            await saveHistory();
+            return;
+        }
+
         // Initialize message buffer for this chat if it doesn't exist
         if (!messageBuffers[message.from]) {
             messageBuffers[message.from] = [];
@@ -497,6 +703,7 @@ client.on('message', async message => {
 // --- STARTUP SEQUENCE ---
 async function start() {
     await loadHistory();
+    await loadAdminState();
     
     // Initialize Excel parser
     console.log('Initializing Excel parser...');
