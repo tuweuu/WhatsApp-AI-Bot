@@ -85,7 +85,7 @@ let excelParser = null;
 let serviceRequestsState = {}; // { [chatId]: Array<{ addressNorm: string, issueNorm: string, addressRaw: string, issueSummaryRaw: string, createdAt: number }> }
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
 
@@ -738,6 +738,8 @@ client.on('message_create', async (message) => {
 
 client.on('message', async message => {
     if (message.isStatus) return;
+    // Ignore our own outgoing messages to prevent self-triggering on broadcasts/mailing
+    if (message.fromMe) return;
 
     // Route admin group commands before generic group handling
     if (ADMIN_GROUP_ID && message.from === ADMIN_GROUP_ID) {
