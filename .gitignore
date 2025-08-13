@@ -1,0 +1,38 @@
+# Node dependencies
+node_modules/
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+logs/
+
+# Runtime data
+pids/
+*.pid
+*.pid.lock
+
+# Testing & coverage
+coverage/
+
+# Package manager caches
+.npm/
+
+# Environment variables and secrets
+.env
+
+# IDE / Editor settings
+.idea/
+.vscode/
+
+# macOS & Windows metadata
+.DS_Store
+Thumbs.db
+
+# WhatsApp Web JS caches and sessions
+.wwebjs_cache/
+.wwebjs_auth/
+
+# Spreadsheet data files (binary)
+*.xlsx
