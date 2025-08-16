@@ -124,10 +124,22 @@ async function sendReplyWithTyping(message, text) {
             await showTypingForDuration(chat, delayMs);
         }
         const formattedText = formatBotMessage(text);
+        
+        // Track this as bot's automated response
+        const targetChatId = message.from;
+        const messageKey = `${targetChatId}:${formattedText}`;
+        botAutomatedResponses.add(messageKey);
+        
         await message.reply(formattedText);
     } catch (e) {
         try { 
             const formattedText = formatBotMessage(text);
+            
+            // Track this as bot's automated response
+            const targetChatId = message.from;
+            const messageKey = `${targetChatId}:${formattedText}`;
+            botAutomatedResponses.add(messageKey);
+            
             await message.reply(formattedText); 
         } catch (_) {}
     }
@@ -141,10 +153,20 @@ async function sendMessageWithTyping(chatId, text) {
             await showTypingForDuration(chat, delayMs);
         }
         const formattedText = formatBotMessage(text);
+        
+        // Track this as bot's automated response
+        const messageKey = `${chatId}:${formattedText}`;
+        botAutomatedResponses.add(messageKey);
+        
         await client.sendMessage(chatId, formattedText);
     } catch (e) {
         try { 
             const formattedText = formatBotMessage(text);
+            
+            // Track this as bot's automated response
+            const messageKey = `${chatId}:${formattedText}`;
+            botAutomatedResponses.add(messageKey);
+            
             await client.sendMessage(chatId, formattedText); 
         } catch (_) {}
     }
@@ -532,20 +554,78 @@ client.on('ready', () => {
     console.log('Client is ready!');
 });
 
-// Also process admin commands the bot sends itself in the admin group
+// Track bot's own automated responses to distinguish from live operator messages
+const botAutomatedResponses = new Set();
+
+// Clean up old automated response tracking entries every 5 minutes
+setInterval(() => {
+    // Clear all entries - they should be processed within seconds anyway
+    botAutomatedResponses.clear();
+    console.log('Cleaned up automated response tracking');
+}, 5 * 60 * 1000);
+
+// Detect when live operator sends message from bot account and cancel pending bot responses
 client.on('message_create', async (message) => {
     try {
-        if (!ADMIN_GROUP_ID) return;
-        if (!message.fromMe) return;
-        const targetChatId = message.to || message.from;
-        const body = (message.body || '').trim();
-        if (targetChatId === ADMIN_GROUP_ID && body.startsWith('!')) {
-            await handleAdminCommand(message);
+        // If this is a message sent by the bot (live operator using bot account)
+        if (message.fromMe) {
+            const targetChatId = message.to || message.from;
+            const messageContent = message.body || '';
+            
+            // Handle admin commands in admin group
+            if (ADMIN_GROUP_ID && targetChatId === ADMIN_GROUP_ID) {
+                const body = messageContent.trim();
+                if (body.startsWith('!')) {
+                    await handleAdminCommand(message);
+                }
+                return;
+            }
+            
+            // If this is a message to a regular user (not group, not admin group)
+            if (!targetChatId.endsWith('@g.us') && targetChatId !== ADMIN_GROUP_ID) {
+                // Check if this is a bot's own automated response
+                const messageKey = `${targetChatId}:${messageContent}`;
+                if (botAutomatedResponses.has(messageKey)) {
+                    // This is the bot's own automated response, remove from tracking and ignore
+                    botAutomatedResponses.delete(messageKey);
+                    return;
+                }
+                
+                // This is a live operator message - cancel pending bot responses
+                console.log(`Live operator sent message to ${targetChatId}, canceling pending bot response`);
+                
+                // Cancel any pending bot response for this user
+                if (messageDebouncers[targetChatId]) {
+                    messageDebouncers[targetChatId].cancel();
+                    console.log(`Canceled pending bot response for ${targetChatId}`);
+                }
+                
+                // Clear message buffer for this user
+                if (messageBuffers[targetChatId]) {
+                    messageBuffers[targetChatId] = [];
+                    console.log(`Cleared message buffer for ${targetChatId}`);
+                }
+                
+                // Add the live operator's message to conversation history
+                if (!conversationHistories[targetChatId]) {
+                    conversationHistories[targetChatId] = [];
+                }
+                
+                conversationHistories[targetChatId].push({
+                    role: "assistant",
+                    type: 'text',
+                    content: messageContent,
+                    timestamp: Date.now(),
+                    isLiveOperator: true
+                });
+                
+                await saveHistory();
+            }
         }
     } catch (e) {
-        console.error('Admin self-command error:', e);
-    }
-});
+        console.error('Live operator detection error:', e);
+     }
+ });
 
 client.on('message', async message => {
     if (message.isStatus) return;

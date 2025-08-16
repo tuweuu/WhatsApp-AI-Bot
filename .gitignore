@@ -33,6 +33,7 @@ Thumbs.db
 # WhatsApp Web JS caches and sessions
 .wwebjs_cache/
 .wwebjs_auth/
+history.json
 
 # Spreadsheet data files (binary)
 *.xlsx
