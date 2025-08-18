@@ -313,7 +313,8 @@ async function handleAdminCommand(message) {
         await muteChat(chatId, ms);
         const untilTs = mutedChats[chatId].until;
         const timeInfo = untilTs ? `до ${formatDateTime(untilTs)} (ещё ${formatDurationShort(untilTs - Date.now())})` : 'бессрочно';
-        await client.sendMessage(replyTarget, `✅ Отключила AI ответы для ${chatId}\n⏳ Срок: ${timeInfo}`);
+        const displayPhone = chatId.replace('@c.us', '');
+        await client.sendMessage(replyTarget, `✅ Отключила AI ответы для ${displayPhone}\n⏳ Срок: ${timeInfo}`);
         return;
     }
     if (cmd === '!unmute') {
@@ -321,7 +322,8 @@ async function handleAdminCommand(message) {
         const chatId = phoneToChatId(phoneArg);
         if (!chatId) { await client.sendMessage(replyTarget, 'Некорректный телефон.'); return; }
         await unmuteChat(chatId);
-        await client.sendMessage(replyTarget, `✅ Включила AI ответы для ${chatId}`);
+        const displayPhone = chatId.replace('@c.us', '');
+        await client.sendMessage(replyTarget, `✅ Включила AI ответы для ${displayPhone}`);
         return;
     }
     if (cmd === '!status') {
@@ -329,12 +331,13 @@ async function handleAdminCommand(message) {
         if (phoneArg) {
             const chatId = phoneToChatId(phoneArg);
             const state = mutedChats[chatId];
-            await client.sendMessage(replyTarget, `${chatId}: ${formatMute(state)}`);
+            const displayPhone = chatId.replace('@c.us', '');
+            await client.sendMessage(replyTarget, `${displayPhone}: ${formatMute(state)}`);
         } else {
             const now = Date.now();
             const entries = Object.entries(mutedChats).filter(([_, e]) => !e.until || e.until > now);
             if (!entries.length) { await client.sendMessage(replyTarget, '✅ Сейчас нет отключенных чатов.'); return; }
-            const lines = entries.map(([id, e]) => `• ${id}: ${formatMute(e)}`);
+            const lines = entries.map(([id, e]) => `• ${id.replace('@c.us', '')}: ${formatMute(e)}`);
             await client.sendMessage(replyTarget, `🧾 Отключенные чаты (${entries.length}):\n${lines.join('\n')}`);
         }
         return;
@@ -773,6 +776,11 @@ client.on('message', async message => {
                     console.log("Received PDF message, adding to batch...");
                     messageBody = await handlePdf(media);
                     userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
+                    
+                    // Check if this is a payment file and forward to accounting group
+                    if (await isPaymentFile(messageBody, media.filename)) {
+                        await forwardPaymentFileToAccounting(message, media);
+                    }
                 } catch (error) {
                     console.error("Error processing PDF:", error);
                     await sendReplyWithTyping(message, "Сейчас не могу открыть файл. Пожалуйста, напишите.");
@@ -815,10 +823,17 @@ client.on('message', async message => {
                     return;
                 }
             } else {
-                // Unsupported file type - handle immediately
-                console.log(`Received unsupported file type: ${media.mimetype}`);
-                await sendReplyWithTyping(message, "Не могу сейчас открыть ваше вложение. Пожалуйста, напишите.");
-                return;
+                // Check if unsupported file type might be a payment document
+                if (await isPaymentFileByType(media.mimetype, media.filename)) {
+                    console.log(`Received potential payment file: ${media.mimetype}`);
+                    await forwardPaymentFileToAccounting(message, media);
+                    userHistoryEntry = { role: "user", type: 'file', content: `Отправлен файл платежа: ${media.filename || 'документ'}`, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
+                } else {
+                    // Unsupported file type - handle immediately
+                    console.log(`Received unsupported file type: ${media.mimetype}`);
+                    await sendReplyWithTyping(message, "Не могу сейчас открыть ваше вложение. Пожалуйста, напишите.");
+                    return;
+                }
             }
         } else {
             userHistoryEntry = { role: "user", type: 'text', content: messageBody };
@@ -856,6 +871,114 @@ client.on('message', async message => {
         await sendReplyWithTyping(message, "Не могу почему то открыть сообщение. Напишите пожалуйста.");
     }
 });
+
+// --- PAYMENT FILE HANDLING ---
+
+/**
+ * Checks if a file is a payment document based on content and filename
+ * @param {string} content - The extracted text content from the file
+ * @param {string} filename - The filename of the document
+ * @returns {Promise<boolean>} - True if this appears to be a payment file
+ */
+async function isPaymentFile(content, filename) {
+    // Check filename for payment-related keywords
+    const paymentKeywords = [
+        'платеж', 'payment', 'квитанция', 'receipt', 'чек', 'оплата',
+        'банк', 'bank', 'перевод', 'transfer', 'счет', 'bill',
+        'коммунальные', 'utilities', 'жкх', 'услуги'
+    ];
+    
+    const filenameCheck = filename && paymentKeywords.some(keyword => 
+        filename.toLowerCase().includes(keyword.toLowerCase())
+    );
+    
+    // Check content for payment-related terms
+    const contentKeywords = [
+        'платеж', 'оплата', 'перевод', 'банк', 'сбербанк', 'втб',
+        'квитанция', 'чек', 'receipt', 'payment', 'коммунальные услуги',
+        'жкх', 'лицевой счет', 'сумма к оплате', 'задолженность',
+        'начислено', 'к доплате', 'переплата'
+    ];
+    
+    const contentCheck = content && contentKeywords.some(keyword => 
+        content.toLowerCase().includes(keyword.toLowerCase())
+    );
+    
+    return filenameCheck || contentCheck;
+}
+
+/**
+ * Checks if a file type might be a payment document based on mimetype and filename
+ * @param {string} mimetype - The MIME type of the file
+ * @param {string} filename - The filename of the document
+ * @returns {Promise<boolean>} - True if this might be a payment file
+ */
+async function isPaymentFileByType(mimetype, filename) {
+    // Common document types that could contain payment information
+    const documentTypes = [
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'text/plain',
+        'image/jpeg',
+        'image/png',
+        'image/webp'
+    ];
+    
+    if (!documentTypes.includes(mimetype)) {
+        return false;
+    }
+    
+    // Check filename for payment-related keywords
+    const paymentKeywords = [
+        'платеж', 'payment', 'квитанция', 'receipt', 'чек', 'оплата',
+        'банк', 'bank', 'перевод', 'transfer', 'счет', 'bill',
+        'коммунальные', 'utilities', 'жкх', 'услуги'
+    ];
+    
+    return filename && paymentKeywords.some(keyword => 
+        filename.toLowerCase().includes(keyword.toLowerCase())
+    );
+}
+
+/**
+ * Forwards a payment file to the accounting group
+ * @param {Object} message - The original WhatsApp message
+ * @param {Object} media - The media object containing the file
+ */
+async function forwardPaymentFileToAccounting(message, media) {
+    if (!ACCOUNTING_GROUP_ID) {
+        console.error('ACCOUNTING_GROUP_ID is not configured, cannot forward payment file');
+        return;
+    }
+    
+    try {
+        // Extract contact information
+        const phone = `+${message.from.split('@')[0]}`;
+        const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
+        
+        // Create message for accounting group
+        const forwardMessage = `💰 *Новый платежный документ*\n\n` +
+                              `📞 *От:* ${cleanContact}\n` +
+                              `📄 *Файл:* ${media.filename || 'Документ'}\n` +
+                              `📅 *Время:* ${new Date().toLocaleString('ru-RU')}\n\n` +
+                              `Пожалуйста, обработайте платежный документ.`;
+        
+        // Send text message first
+        await client.sendMessage(ACCOUNTING_GROUP_ID, forwardMessage);
+        
+        // Forward the actual file
+        const mediaMessage = new MessageMedia(media.mimetype, media.data, media.filename);
+        await client.sendMessage(ACCOUNTING_GROUP_ID, mediaMessage);
+        
+        console.log(`Payment file forwarded to accounting group from ${message.from}`);
+        
+    } catch (error) {
+        console.error('Error forwarding payment file to accounting:', error);
+        await sendReplyWithTyping(message, "Документ получен, но возникла ошибка при передаче в бухгалтерию. Пожалуйста, обратитесь в офис.");
+    }
+}
 
 // --- STARTUP SEQUENCE ---
 async function start() {
