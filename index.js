@@ -8,6 +8,7 @@ const ExcelParser = require('./excel-parser');
 const { Debouncer } = require('@tanstack/pacer');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
@@ -537,9 +538,9 @@ async function processBatchedMessages(chatId) {
                     break;
             }
             
-            const requestSent = await sendRequestToGroup(groupId, requestData, routingType);
+            const requestResult = await sendRequestToGroup(groupId, requestData, routingType);
             
-            if (requestSent) {
+            if (requestResult.success) {
                 // Remove the system context message if we added one
                 if (combinedContext) {
                     history.pop();
@@ -547,11 +548,11 @@ async function processBatchedMessages(chatId) {
                 
                 let confirmationMessage;
                 if (routingType === 'GENERAL') {
-                    confirmationMessage = "Ваш запрос передан в службу управления домом. При необходимости - специалист свяжется с вами в ближайшее время.";
+                    confirmationMessage = `Ваш запрос передан в службу управления домом.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nПри необходимости - специалист свяжется с вами в ближайшее время.`;
                 } else if (routingType === 'ACCOUNTING') {
-                    confirmationMessage = "Ваш запрос передан в бухгалтерию. Специалист свяжется с вами в ближайшее время.";
+                    confirmationMessage = `Ваш запрос передан в бухгалтерию.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nСпециалист свяжется с вами в ближайшее время.`;
                 } else if (routingType === 'ADMIN') {
-                    confirmationMessage = "Ваш запрос передан для подключения живого ассистента. С вами свяжутся в ближайшее время.";
+                    confirmationMessage = `Ваш запрос передан для подключения живого ассистента.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nС вами свяжутся в ближайшее время.`;
                     // For admin routing, disable AI responses for this user
                     await muteChat(chatId, '24h');
                 }
@@ -1188,13 +1189,18 @@ Important: For details, analyze only the latest request topic and provide focuse
 async function sendRequestToGroup(groupId, requestData, routingType) {
     if (!groupId) {
         console.error(`${routingType} group ID is not configured`);
-        return false;
+        return { success: false, requestId: null };
     }
+
+    // Generate unique request ID
+    const requestId = uuidv4();
+    const shortRequestId = '#' + requestId.substring(0, 8).toUpperCase();
 
     const groupName = routingType === 'GENERAL' ? 'Общие вопросы' : 
                      routingType === 'ACCOUNTING' ? 'Бухгалтерия' : 'Администрация';
     
     const requestMessage = `🔔 *Новый запрос - ${groupName}*\n\n` +
+                          `🆔 *Номер заявки:* ${shortRequestId}\n` +
                           `📍 *Адрес:* ${requestData.address}\n` +
                           `📞 *Контакт:* ${requestData.contact}\n` +
                           `❗ *Проблема:* ${requestData.issue}\n` +
@@ -1202,11 +1208,11 @@ async function sendRequestToGroup(groupId, requestData, routingType) {
 
     try {
         await client.sendMessage(groupId, requestMessage);
-        console.log(`Request sent to ${routingType} group: ${groupId}`);
-        return true;
+        console.log(`Request sent to ${routingType} group: ${groupId}, Request ID: ${shortRequestId}`);
+        return { success: true, requestId: shortRequestId };
     } catch (error) {
         console.error(`Error sending request to ${routingType} group:`, error);
-        return false;
+        return { success: false, requestId: null };
     }
 }
 
