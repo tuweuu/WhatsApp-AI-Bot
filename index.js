@@ -17,18 +17,24 @@ const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resid
 const HISTORY_FILE_PATH = './history.json';
 const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
 
-// --- ADMIN INTEGRATION ---
+// --- GROUP ROUTING INTEGRATION ---
 const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID || null;
+const GENERAL_GROUP_ID = process.env.GENERAL_GROUP_ID || null;
+const ACCOUNTING_GROUP_ID = process.env.ACCOUNTING_GROUP_ID || null;
 const ADMIN_STATE_FILE_PATH = './admin-state.json';
 
 const SYSTEM_PROMPT = `Ты - виртуальный помощник Кристина УК "Прогресс".
 
 Твои задачи:
 - Консультировать по услугам, графику, контактам.
-- Принимать заявки на ремонт: перед приемом заявки узнай как можно больше информации, например: проблема во всем доме или в одной квартире? уточни адрес и время, подтверди прием заявки.
-- Помогать с оплатой.
+- Принимать заявки на ремонт и жалобы: ОБЯЗАТЕЛЬНО собери всю необходимую информацию перед передачей заявки. Задавай уточняющие вопросы:
+  * Для ремонта: точное описание проблемы, где именно (адрес/квартира/подъезд/весь дом), когда началось
+  * Для жалоб: детали ситуации, когда произошло
+  * Для бухгалтерских вопросов: собери основную информацию и передай заявку, не нужно вытаскивать подробности, ибо это не в твоих обязаностях
+  * Всегда уточняй адрес (улица, дом, квартира)
+- Помогать с оплатой и документами: для простых запросов документов (квитанции, справки) собирай минимум информации и передавай заявку.
 - Предоставлять номера лицевых счетов жильцам для входа в приложение (нужны ФИО и точный адрес).
-- Фиксировать жалобы.
+- НЕ передавай неполные заявки - лучше задай дополнительные вопросы.
 
 КОГДА ЖИЛЕЦ ПРОСИТ ЛИЦЕВОЙ СЧЕТ:
 - Естественно попроси полное ФИО (фамилия и имя достаточно)
@@ -71,7 +77,7 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
 
@@ -482,6 +488,84 @@ async function processBatchedMessages(chatId) {
             history.push({ role: "system", type: 'text', content: combinedContext });
         }
         
+        // Analyze if request should be routed to a group
+        const routingType = await analyzeRequestForRouting(history);
+        
+        if (routingType && routingType !== 'NONE') {
+            // Check if request has sufficient information before routing
+            const completenessAnalysis = await analyzeRequestCompleteness(history, routingType);
+            
+            if (!completenessAnalysis.complete) {
+                // Remove the system context message if we added one
+                if (combinedContext) {
+                    history.pop();
+                }
+                
+                // Ask clarifying questions instead of routing
+                const clarifyingMessage = completenessAnalysis.clarifyingQuestions.length > 0 
+                    ? completenessAnalysis.clarifyingQuestions.join(' ') 
+                    : 'Для обработки вашего запроса мне нужна дополнительная информация. Можете предоставить более подробные сведения?';
+                
+                history.push({ role: "assistant", type: 'text', content: clarifyingMessage });
+                conversationHistories[chatId] = history;
+                
+                const lastMessage = messages[messages.length - 1].originalMessage;
+                await sendReplyWithTyping(lastMessage, clarifyingMessage);
+                await saveHistory();
+                
+                // Clear the buffer
+                messageBuffers[chatId] = [];
+                return;
+            }
+            
+            // Format and send request to appropriate group
+            const requestData = await formatRequestForGroup(history, chatId, routingType);
+            
+            let groupId;
+            switch (routingType) {
+                case 'GENERAL':
+                    groupId = GENERAL_GROUP_ID;
+                    break;
+                case 'ACCOUNTING':
+                    groupId = ACCOUNTING_GROUP_ID;
+                    break;
+                case 'ADMIN':
+                    groupId = ADMIN_GROUP_ID;
+                    break;
+            }
+            
+            const requestSent = await sendRequestToGroup(groupId, requestData, routingType);
+            
+            if (requestSent) {
+                // Remove the system context message if we added one
+                if (combinedContext) {
+                    history.pop();
+                }
+                
+                let confirmationMessage;
+                if (routingType === 'GENERAL') {
+                    confirmationMessage = "Ваш запрос передан в службу управления домом. При необходимости - специалист свяжется с вами в ближайшее время.";
+                } else if (routingType === 'ACCOUNTING') {
+                    confirmationMessage = "Ваш запрос передан в бухгалтерию. Специалист свяжется с вами в ближайшее время.";
+                } else if (routingType === 'ADMIN') {
+                    confirmationMessage = "Ваш запрос передан для подключения живого ассистента. С вами свяжутся в ближайшее время.";
+                    // For admin routing, disable AI responses for this user
+                    await muteChat(chatId, '24h');
+                }
+                
+                history.push({ role: "assistant", type: 'text', content: confirmationMessage });
+                conversationHistories[chatId] = history;
+                
+                const lastMessage = messages[messages.length - 1].originalMessage;
+                await sendReplyWithTyping(lastMessage, confirmationMessage);
+                await saveHistory();
+                
+                // Clear the buffer
+                messageBuffers[chatId] = [];
+                return;
+            }
+        }
+        
         const aiResponse = await getOpenAIResponse(history);
         
         // Remove the system context message if we added one
@@ -835,8 +919,173 @@ async function summarizeHistory(chatId) {
     }
 }
 
-// --- ACCOUNTING REQUEST FUNCTIONS ---
+// --- GROUP ROUTING FUNCTIONS ---
 
+async function analyzeRequestForRouting(history) {
+    const ROUTING_PROMPT = `Analyze the conversation history and determine if this requires routing to a working group.
+
+DO NOT route if the user is:
+- Saying thank you, expressing gratitude (спасибо, благодарю, etc.)
+- Asking simple clarifying questions (что?, зачем?, почему?)
+- Having casual conversation
+- Responding to bot confirmations
+- Just acknowledging previous messages
+
+ONLY route if there is a NEW, SPECIFIC request for:
+1. GENERAL - Complaints, emergencies, repairs, maintenance issues, building problems, utilities, heating, water, electricity, elevators, cleaning, security, noise complaints
+2. ACCOUNTING - Documentation requests, receipts, payment issues, account statements, billing questions, payment confirmations, salary and financial matters (BUT NOT account number lookup requests - those are handled automatically)
+3. ADMIN - When the bot cannot help, gets stuck, requires human intervention, or when the user is frustrated with automated responses
+
+DO NOT route account number/лицевой счет lookup requests - the bot handles these automatically with Excel data.
+
+Return ONLY one word: GENERAL, ACCOUNTING, ADMIN, or NONE
+
+If this is just a thank you, question, or casual response - return NONE.`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: ROUTING_PROMPT },
+                ...history.map(m => ({role: m.role, content: m.content}))
+            ],
+            max_tokens: 10
+        });
+        const response = completion.choices[0].message.content.trim().toUpperCase();
+        return ['GENERAL', 'ACCOUNTING', 'ADMIN', 'NONE'].includes(response) ? response : 'NONE';
+    } catch (error) {
+        console.error('Error analyzing request for routing:', error);
+        return 'NONE'; // Default fallback - don't route on error
+    }
+}
+
+async function analyzeRequestCompleteness(history, routingType) {
+    const COMPLETENESS_PROMPT = `Analyze the conversation history to determine if there is enough information to create a complete ${routingType.toLowerCase()} request.
+
+For a GENERAL request (complaints, repairs, emergencies), check if the following information is available:
+1. Clear description of the problem/issue
+2. Location details (apartment number, floor, specific area)
+4. Any relevant context (when it started, frequency, etc.)
+
+For an ACCOUNTING request (documents, receipts, financial), check if:
+1. Basic document type mentioned (квитанция, справка, документ)
+2. General timeframe if relevant (не обязательно точные даты)
+For simple document requests like receipts - minimal information is sufficient.
+
+For an ADMIN request, check if:
+1. Clear description of the complex issue
+2. Previous attempts to resolve
+3. Specific assistance needed
+
+Return JSON with:
+- "complete": true/false
+- "missing_info": array of missing information types
+- "clarifying_questions": array of specific questions to ask (max 2 questions)
+
+If information is incomplete, suggest clarifying questions that would help gather the missing details.`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: COMPLETENESS_PROMPT },
+                ...history.map(m => ({role: m.role, content: m.content}))
+            ],
+            response_format: { type: "json_object" },
+            max_tokens: 300
+        });
+        
+        const analysis = JSON.parse(completion.choices[0].message.content);
+        return {
+            complete: analysis.complete || false,
+            missingInfo: analysis.missing_info || [],
+            clarifyingQuestions: analysis.clarifying_questions || []
+        };
+    } catch (error) {
+        console.error('Error analyzing request completeness:', error);
+        // Default to incomplete to be safe
+        return {
+            complete: false,
+            missingInfo: ['Общая информация'],
+            clarifyingQuestions: ['Можете предоставить более подробную информацию о вашем запросе?']
+        };
+    }
+}
+
+async function formatRequestForGroup(history, chatId, routingType) {
+    const FORMATTING_PROMPT = `Analyze the conversation history and extract the following information for a ${routingType.toLowerCase()} request:
+
+1. Address: Extract the full house address mentioned in the conversation
+2. Contact: The phone number (should start with +7, without c.us)
+3. Issue: Brief description of the reason for the request (one sentence)
+4. Details: More information about the issue, but concise - maximum 40 words. Focus ONLY on the most recent relevant request, do not mix different requests.
+
+Return the data in JSON format with keys: 'address', 'contact', 'issue', 'details'
+If any information is missing, use 'Не указано' for that field.
+
+Important: For details, analyze only the latest request topic and provide focused information without mixing different issues.`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: FORMATTING_PROMPT },
+                ...history.map(m => ({role: m.role, content: m.content}))
+            ],
+            response_format: { type: "json_object" },
+            max_tokens: 200
+        });
+        
+        const extractedData = JSON.parse(completion.choices[0].message.content);
+        
+        // Ensure contact starts with +7 and clean it
+        const phone = `+${chatId.split('@')[0]}`;
+        const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
+        
+        return {
+            address: extractedData.address || 'Не указано',
+            contact: cleanContact,
+            issue: extractedData.issue || 'Не указано',
+            details: extractedData.details || 'Не указано'
+        };
+    } catch (error) {
+        console.error('Error formatting request:', error);
+        const phone = `+${chatId.split('@')[0]}`;
+        const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
+        
+        return {
+            address: 'Не указано',
+            contact: cleanContact,
+            issue: 'Требуется обработка запроса',
+            details: 'Ошибка при обработке деталей запроса'
+        };
+    }
+}
+
+async function sendRequestToGroup(groupId, requestData, routingType) {
+    if (!groupId) {
+        console.error(`${routingType} group ID is not configured`);
+        return false;
+    }
+
+    const groupName = routingType === 'GENERAL' ? 'Общие вопросы' : 
+                     routingType === 'ACCOUNTING' ? 'Бухгалтерия' : 'Администрация';
+    
+    const requestMessage = `🔔 *Новый запрос - ${groupName}*\n\n` +
+                          `📍 *Адрес:* ${requestData.address}\n` +
+                          `📞 *Контакт:* ${requestData.contact}\n` +
+                          `❗ *Проблема:* ${requestData.issue}\n` +
+                          `📝 *Детали:* ${requestData.details}`;
+
+    try {
+        await client.sendMessage(groupId, requestMessage);
+        console.log(`Request sent to ${routingType} group: ${groupId}`);
+        return true;
+    } catch (error) {
+        console.error(`Error sending request to ${routingType} group:`, error);
+        return false;
+    }
+}
 
 // --- ACCOUNT LOOKUP FUNCTIONS ---
 
