@@ -1,0 +1,30 @@
+[
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Документ-2025-08-22-151430.pdf",
+    "timestamp": 1755864925761,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "эльзы13, кв. 70. оплата на расчетный счет",
+    "timestamp": 1755864935416,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "проверь пожалуйста",
+    "timestamp": 1755864960799,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "ок, сейчас пробью",
+    "timestamp": 1755865060636,
+    "isLiveOperator": true
+  }
+]

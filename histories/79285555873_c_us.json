@@ -1,0 +1,36 @@
+[
+  {
+    "role": "user",
+    "type": "text",
+    "content": "Малыгина 35к1 кв. 26"
+  },
+  {
+    "role": "user",
+    "type": "text",
+    "content": "Здравствуйте"
+  },
+  {
+    "role": "user",
+    "type": "text",
+    "content": "Не работает лифт три недели"
+  },
+  {
+    "role": "user",
+    "type": "text",
+    "content": "Грузовой"
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Добрый день\nУточнила у механика, ждем заказную деталь для замены",
+    "timestamp": 1755766261250,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Неделю назад лифт работал",
+    "timestamp": 1755766271728,
+    "isLiveOperator": true
+  }
+]

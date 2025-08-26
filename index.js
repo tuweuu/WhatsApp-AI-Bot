@@ -5,17 +5,21 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const pdf = require('pdf-parse');
 const ExcelParser = require('./excel-parser');
+const HistoryManager = require('./history-manager');
 const { Debouncer } = require('@tanstack/pacer');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { getCurrentBotConfig, hasAdminAccess, getSystemPrompt, getDisplayName, getClientId } = require('./bot-config');
+const { format, isWeekend, isToday, addDays, getDay, setHours, getHours } = require('date-fns');
+const { ru } = require('date-fns/locale');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
 const OPENAI_MODEL = "gpt-4.1";
-const MAX_HISTORY_LENGTH = 20;
+const MAX_HISTORY_LENGTH = 50;
 const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
-const HISTORY_FILE_PATH = './history.json';
+
 const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
 
 // --- GROUP ROUTING INTEGRATION ---
@@ -24,56 +28,46 @@ const GENERAL_GROUP_ID = process.env.GENERAL_GROUP_ID || null;
 const ACCOUNTING_GROUP_ID = process.env.ACCOUNTING_GROUP_ID || null;
 const ADMIN_STATE_FILE_PATH = './admin-state.json';
 
-const SYSTEM_PROMPT = `Ты - виртуальный помощник Кристина УК "Прогресс".
+// Get system prompt from configuration
+const SYSTEM_PROMPT = getSystemPrompt();
 
-Твои задачи:
-- Консультировать по услугам, графику, контактам.
-- Принимать заявки на ремонт и жалобы: ОБЯЗАТЕЛЬНО собери всю необходимую информацию перед передачей заявки. Задавай уточняющие вопросы:
-  * Для ремонта: точное описание проблемы, где именно (адрес/квартира/подъезд/весь дом), когда началось
-  * Для жалоб: детали ситуации, когда произошло
-  * Для бухгалтерских вопросов: собери основную информацию и передай заявку, не нужно вытаскивать подробности, ибо это не в твоих обязаностях
-  * Всегда уточняй адрес (улица, дом, квартира)
-- Помогать с оплатой и документами: для простых запросов документов (квитанции, справки) собирай минимум информации и передавай заявку.
-- Предоставлять номера лицевых счетов жильцам для входа в приложение (нужны ФИО и точный адрес).
-- НЕ передавай неполные заявки - лучше задай дополнительные вопросы.
-
-КОГДА ЖИЛЕЦ ПРОСИТ ЛИЦЕВОЙ СЧЕТ:
-- Естественно попроси полное ФИО (фамилия и имя достаточно)
-- Попроси точный адрес (улица, дом, квартира)
-- Собирай информацию постепенно в ходе беседы
-- Когда у тебя есть полное ФИО и адрес, добавь в свой ответ слово LOOKUP_ACCOUNT чтобы система могла найти счет
-- Если предоставленная информация не подходит, вежливо попроси уточнить данные
-- При неудаче предложи обратиться в офис
-
-Справочная информация:
-- График: Пн-Пт, 9:00-18:00.
-- Адрес: Ирчи Казака 31.
-- Офис: +7 (800) 444-52-05.
-- Контакты юриста: +7 (929) 867-91-90.
-- Оплата: Переводом на номер: +7 (900) 050 11 11, в офисе или через приложение УК «Прогресс».
-  - iOS: https://apps.apple.com/app/id6738488843
-  - Android: https://play.google.com/store/apps/details?id=ru.burmistr.app.client.c_4296
-
-Важно:
-- Будь профессиональной и четкой. Избегай излишней эмпатии и фраз вроде \"Мы понимаем ваше расстройство\", но продолжай быть вежливой и на фразы "Спасибо" или "До свидания" - отвечай так же тепло.
-- Отвечай кратко и по делу. Не предлагай свою помощь каждый раз. Если жильцу нужна помощь - он сам обратится.
-- Ссылки отправляй как обычный текст, без форматирования.
-- Говори только на русском.
-- Не придумывай, если не знаешь ответ.
-- Представляйся как виртуальный помощник, а не живой сотрудник.
-
-Цель: быстро помочь и оставить приятное впечатление.`;
+// --- WORKING HOURS HELPER ---
+function isWorkingHours() {
+    const now = new Date();
+    const currentHour = getHours(now);
+    const currentDay = getDay(now); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+    
+    // Check if it's weekend (Saturday = 6, Sunday = 0)
+    if (currentDay === 0 || currentDay === 6) {
+        return false;
+    }
+    
+    // Check if it's after 18:00 (6 PM)
+    if (currentHour >= 18) {
+        return false;
+    }
+    
+    return true;
+}
 
 // --- INITIALIZATION ---
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Get current bot configuration
+const botConfig = getCurrentBotConfig();
+console.log(`Starting bot instance: ${botConfig.name} (${botConfig.clientId})`);
+
 const client = new Client({
-    authStrategy: new LocalAuth()
+    authStrategy: new LocalAuth({
+        clientId: botConfig.clientId,
+        dataPath: `./auth-sessions/${botConfig.clientId}`
+    })
 });
 
-let conversationHistories = {};
+// Initialize the new history manager
+const historyManager = new HistoryManager();
 let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
@@ -120,7 +114,7 @@ function formatBotMessage(text) {
         return `_${line.trim()}_`;
     });
     
-    return `*[Bot Кристина]:*\n${formattedLines.join('\n')}`;
+    return `*[${getDisplayName()}]:*\n${formattedLines.join('\n')}`;
 }
 
 async function sendReplyWithTyping(message, text) {
@@ -179,28 +173,72 @@ async function sendMessageWithTyping(chatId, text) {
     }
 }
 
+// --- DATE/TIME AWARENESS FUNCTIONS ---
+function getCurrentDateTimeContext() {
+    const now = new Date();
+    const today = format(now, 'EEEE, d MMMM yyyy', { locale: ru });
+    const currentTime = format(now, 'HH:mm', { locale: ru });
+    const dayOfWeek = getDay(now); // 0 = Sunday, 1 = Monday, etc.
+    const isCurrentWeekend = isWeekend(now);
+    
+    // Check if tomorrow is weekend
+    const tomorrow = addDays(now, 1);
+    const isTomorrowWeekend = isWeekend(tomorrow);
+    const tomorrowName = format(tomorrow, 'EEEE', { locale: ru });
+    
+    // Determine if it's working hours (9 AM to 6 PM, Monday to Friday)
+    const currentHour = getHours(now);
+    const isWorkingDay = !isCurrentWeekend;
+    const isWorkingHours = isWorkingDay && currentHour >= 9 && currentHour < 18;
+    
+    let context = `ТЕКУЩАЯ ДАТА И ВРЕМЯ:
+`;
+    context += `Сегодня: ${today}
+`;
+    context += `Время: ${currentTime}
+`;
+    context += `Завтра: ${tomorrowName}`;
+    
+    if (isCurrentWeekend) {
+        context += `\nСегодня выходной день (суббота/воскресенье)`;
+    }
+    
+    if (isTomorrowWeekend) {
+        context += `\nЗавтра выходной день (суббота/воскресенье)`;
+    }
+    
+    if (isWorkingHours) {
+        context += `\nСейчас рабочее время (9:00-18:00, понедельник-пятница)`;
+    } else if (isWorkingDay) {
+        context += `\nСейчас нерабочее время (рабочие часы: 9:00-18:00)`;
+    }
+    
+    context += `\n\nИСПОЛЬЗУЙ ЭТУ ИНФОРМАЦИЮ для ответов на вопросы о времени, рабочих днях, выходных, "завтра", "сегодня", "сейчас" и т.д.`;
+    
+    return context;
+}
+
 // --- PERSISTENCE FUNCTIONS ---
-async function saveHistory() {
-    try {
-        const data = JSON.stringify(conversationHistories, null, 2);
-        await fs.writeFile(HISTORY_FILE_PATH, data, 'utf8');
-    } catch (error) {
-        console.error("Error saving conversation history:", error);
+// Legacy functions for backward compatibility - now use HistoryManager
+async function saveHistory(chatId = null) {
+    // If chatId is provided, save only that chat
+    if (chatId) {
+        await historyManager.saveChatHistory(chatId);
+    } else {
+        // Save all chats in memory (for backward compatibility)
+        const chatIds = historyManager.getAllChatIds();
+        for (const id of chatIds) {
+            await historyManager.saveChatHistory(id);
+        }
     }
 }
 
 async function loadHistory() {
-    try {
-        await fs.access(HISTORY_FILE_PATH);
-        const data = await fs.readFile(HISTORY_FILE_PATH, 'utf8');
-        conversationHistories = JSON.parse(data);
-        console.log("Successfully loaded conversation history from file.");
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            console.log("No history file found. Starting with a fresh history.");
-        } else {
-            console.error("Error loading conversation history:", error);
-        }
+    // Initialize the history manager and migrate if needed
+    await historyManager.initialize();
+    const migrationResult = await historyManager.migrateFromOldFormat();
+    if (migrationResult.success && migrationResult.migratedCount > 0) {
+        console.log(`Migration completed: ${migrationResult.migratedCount} chats migrated`);
     }
 }
 
@@ -301,6 +339,13 @@ function formatMute(entry) {
 }
 
 async function handleAdminCommand(message) {
+    // Check if current bot instance has admin access
+    if (!hasAdminAccess()) {
+        const replyTarget = message.fromMe ? (message.to || message.from) : message.from;
+        await client.sendMessage(replyTarget, 'У вас нет доступа к административным командам.');
+        return;
+    }
+    
     const raw = (message.body || '').trim();
     const [cmdRaw, phoneArg, durArg] = raw.split(/\s+/);
     const cmd = (cmdRaw || '').toLowerCase();
@@ -385,6 +430,25 @@ function formatDateTime(ts) {
         return new Date(ts).toLocaleString('ru-RU');
     } catch (_) {
         return new Date(ts).toLocaleString();
+    }
+}
+
+// --- FILE SENDING FUNCTION ---
+/**
+ * Sends a file from message history back to the user
+ * @param {Object} message - The original WhatsApp message
+ * @param {Object} historyEntry - The history entry containing file data
+ */
+async function sendFileFromHistory(message, historyEntry) {
+    try {
+        if (historyEntry.type === 'file' && historyEntry.media) {
+            const { mimetype, filename } = historyEntry.media;
+            const fileInfo = `📄 File: ${filename || 'document'} (${mimetype})\n\nContent: ${historyEntry.content}`;
+            await sendReplyWithTyping(message, fileInfo);
+        }
+    } catch (error) {
+        console.error('Error sending file from history:', error);
+        await sendReplyWithTyping(message, 'Could not resend the file.');
     }
 }
 
@@ -473,7 +537,7 @@ async function processBatchedMessages(chatId) {
 
     console.log(`Processing ${messages.length} batched messages for ${chatId}`);
     
-    const history = conversationHistories[chatId] || [];
+    const history = await historyManager.getHistory(chatId);
     
     // Add all buffered messages to history
     for (const messageData of messages) {
@@ -511,11 +575,10 @@ async function processBatchedMessages(chatId) {
                     : 'Для обработки вашего запроса мне нужна дополнительная информация. Можете предоставить более подробные сведения?';
                 
                 history.push({ role: "assistant", type: 'text', content: clarifyingMessage });
-                conversationHistories[chatId] = history;
+                await historyManager.updateHistory(chatId, history);
                 
                 const lastMessage = messages[messages.length - 1].originalMessage;
                 await sendReplyWithTyping(lastMessage, clarifyingMessage);
-                await saveHistory();
                 
                 // Clear the buffer
                 messageBuffers[chatId] = [];
@@ -547,22 +610,24 @@ async function processBatchedMessages(chatId) {
                 }
                 
                 let confirmationMessage;
+                const workingHours = isWorkingHours();
+                const contactTime = workingHours ? 'в ближайшее время' : 'в рабочее время';
+                
                 if (routingType === 'GENERAL') {
-                    confirmationMessage = `Ваш запрос передан в службу управления домом.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nПри необходимости - специалист свяжется с вами в ближайшее время.`;
+                    confirmationMessage = `Ваш запрос передан в службу управления домом.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nПри необходимости - специалист свяжется с вами ${contactTime}.`;
                 } else if (routingType === 'ACCOUNTING') {
-                    confirmationMessage = `Ваш запрос передан в бухгалтерию.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nСпециалист свяжется с вами в ближайшее время.`;
+                    confirmationMessage = `Ваш запрос передан в бухгалтерию.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nСпециалист свяжется с вами ${contactTime}.`;
                 } else if (routingType === 'ADMIN') {
-                    confirmationMessage = `Ваш запрос передан для подключения живого ассистента.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nС вами свяжутся в ближайшее время.`;
+                    confirmationMessage = `Ваш запрос передан для подключения живого ассистента.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nС вами свяжутся ${contactTime}.`;
                     // For admin routing, disable AI responses for this user
                     await muteChat(chatId, '24h');
                 }
                 
                 history.push({ role: "assistant", type: 'text', content: confirmationMessage });
-                conversationHistories[chatId] = history;
+                await historyManager.updateHistory(chatId, history);
                 
                 const lastMessage = messages[messages.length - 1].originalMessage;
                 await sendReplyWithTyping(lastMessage, confirmationMessage);
-                await saveHistory();
                 
                 // Clear the buffer
                 messageBuffers[chatId] = [];
@@ -581,8 +646,7 @@ async function processBatchedMessages(chatId) {
         if (aiResponse.includes('LOOKUP_ACCOUNT')) {
             const accountHandled = await handleAccountLookup(chatId, history);
             if (accountHandled) {
-                conversationHistories[chatId] = history;
-                await saveHistory();
+                await historyManager.updateHistory(chatId, history);
                 // Clear the buffer
                 messageBuffers[chatId] = [];
                 return;
@@ -590,25 +654,23 @@ async function processBatchedMessages(chatId) {
             // Remove the LOOKUP_ACCOUNT keyword from the response
             const cleanedResponse = aiResponse.replace('LOOKUP_ACCOUNT', '').trim();
             history.push({ role: "assistant", type: 'text', content: cleanedResponse });
-            conversationHistories[chatId] = history;
+            await historyManager.updateHistory(chatId, history);
             
             // Reply to the last message in the batch
             const lastMessage = messages[messages.length - 1].originalMessage;
             await sendReplyWithTyping(lastMessage, cleanedResponse);
-            await saveHistory();
         } else {
             // Normal reply
             history.push({ role: "assistant", type: 'text', content: aiResponse });
-            conversationHistories[chatId] = history;
+            await historyManager.updateHistory(chatId, history);
             const lastMessage = messages[messages.length - 1].originalMessage;
             await sendReplyWithTyping(lastMessage, aiResponse);
-            await saveHistory();
         }
 
+        // Check if summarization is needed (handled by historyManager.addMessage)
         if (history.length > MAX_HISTORY_LENGTH) {
             console.log(`History for ${chatId} exceeds limit. Triggering summarization.`);
             await summarizeHistory(chatId);
-            await saveHistory();
         }
 
     } catch (error) {
@@ -635,7 +697,11 @@ function getOrCreateDebouncer(chatId) {
 
 // --- WHATSAPP CLIENT EVENTS ---
 client.on('qr', qr => {
+    const currentBot = getCurrentBotConfig();
+    const scanMessage = `=== SCAN FOR ${currentBot.name.toUpperCase()} ===`;
+    console.log(`\n${scanMessage}\n`);
     qrcode.generate(qr, { small: true });
+    console.log(`\n${scanMessage}\n`);
 });
 
 client.on('ready', () => {
@@ -695,19 +761,13 @@ client.on('message_create', async (message) => {
                 }
                 
                 // Add the live operator's message to conversation history
-                if (!conversationHistories[targetChatId]) {
-                    conversationHistories[targetChatId] = [];
-                }
-                
-                conversationHistories[targetChatId].push({
+                await historyManager.addMessage(targetChatId, {
                     role: "assistant",
                     type: 'text',
                     content: messageContent,
                     timestamp: Date.now(),
                     isLiveOperator: true
                 });
-                
-                await saveHistory();
             }
         }
     } catch (e) {
@@ -743,7 +803,7 @@ client.on('message', async message => {
 
     // Handle special commands immediately (no debouncing)
     if (messageBody.toLowerCase() === '!reset') {
-        delete conversationHistories[message.from];
+        await historyManager.deleteHistory(message.from);
         // Also clear any pending messages and cancel debouncer
         messageBuffers[message.from] = [];
         if (messageDebouncers[message.from]) {
@@ -766,7 +826,7 @@ client.on('message', async message => {
                         { type: 'text', text: message.body },
                         { type: 'image_url', image_url: { url: `data:${media.mimetype};base64,${media.data}` } }
                     ];
-                    userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
+                    userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype } };
                 } catch (error) {
                     console.error("Error processing image:", error);
                     await sendReplyWithTyping(message, "Сейчас не могу открыть фото. Пожалуйста, напишите.");
@@ -776,7 +836,7 @@ client.on('message', async message => {
                 try {
                     console.log("Received PDF message, adding to batch...");
                     messageBody = await handlePdf(media);
-                    userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
+                    userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, filename: media.filename } };
                     
                     // Check if this is a payment file and forward to accounting group
                     if (await isPaymentFile(messageBody, media.filename)) {
@@ -802,7 +862,7 @@ client.on('message', async message => {
                     await fs.unlink(tempFilePath);
                     messageBody = transcription.text;
                     console.log(`Transcription result: \"${messageBody}\"`);
-                    userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype, data: media.data } };
+                    userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype } };
                 } catch (error) {
                     console.error("Error transcribing audio:", error);
                     await sendReplyWithTyping(message, "Не разобрала ваше голосовое. Пожалуйста, напишите.");
@@ -817,7 +877,7 @@ client.on('message', async message => {
                         await sendReplyWithTyping(message, openAIContent);
                         return;
                     }
-                    userHistoryEntry = { role: "user", type: 'video', content: openAIContent, media: { mimetype: media.mimetype, data: media.data } };
+                    userHistoryEntry = { role: "user", type: 'video', content: openAIContent, media: { mimetype: media.mimetype } };
                 } catch (error) {
                     console.error("Error processing video:", error);
                     await sendReplyWithTyping(message, "Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.");
@@ -828,7 +888,7 @@ client.on('message', async message => {
                 if (await isPaymentFileByType(media.mimetype, media.filename)) {
                     console.log(`Received potential payment file: ${media.mimetype}`);
                     await forwardPaymentFileToAccounting(message, media);
-                    userHistoryEntry = { role: "user", type: 'file', content: `Отправлен файл платежа: ${media.filename || 'документ'}`, media: { mimetype: media.mimetype, data: media.data, filename: media.filename } };
+                    userHistoryEntry = { role: "user", type: 'file', content: `Отправлен файл платежа: ${media.filename || 'документ'}`, media: { mimetype: media.mimetype, filename: media.filename } };
                 } else {
                     // Unsupported file type - handle immediately
                     console.log(`Received unsupported file type: ${media.mimetype}`);
@@ -842,10 +902,7 @@ client.on('message', async message => {
 
         // If chat is muted, store to history and do not reply/buffer
         if (isChatMuted(message.from)) {
-            const history = conversationHistories[message.from] || [];
-            history.push(userHistoryEntry);
-            conversationHistories[message.from] = history;
-            await saveHistory();
+            await historyManager.addMessage(message.from, userHistoryEntry);
             return;
         }
 
@@ -1006,9 +1063,13 @@ async function getOpenAIResponse(richHistory) {
             content: msg.content
         }));
 
+        // Add current date/time context to the system prompt
+        const dateTimeContext = getCurrentDateTimeContext();
+        const enhancedSystemPrompt = `${SYSTEM_PROMPT}\n\n${dateTimeContext}`;
+
         const completion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
-            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...openAIMessages],
+            messages: [{ role: "system", content: enhancedSystemPrompt }, ...openAIMessages],
             max_tokens: 300
         });
         const response = completion.choices[0].message.content.trim();
@@ -1021,7 +1082,7 @@ async function getOpenAIResponse(richHistory) {
 }
 
 async function summarizeHistory(chatId) {
-    const history = conversationHistories[chatId];
+    const history = await historyManager.getHistory(chatId);
     if (!history || history.length === 0) return;
 
     console.log(`Summarizing ${history.length} messages for chat ${chatId}...`);
@@ -1033,10 +1094,11 @@ async function summarizeHistory(chatId) {
     try {
         const summaryResponse = await getOpenAIResponse(summarizationMessages);
         const recentHistory = history.slice(-5);
-        conversationHistories[chatId] = [
+        const newHistory = [
             { role: "system", type: 'text', content: `Summary of previous conversation: ${summaryResponse}` },
             ...recentHistory
         ];
+        await historyManager.updateHistory(chatId, newHistory);
         console.log(`Summarization complete for ${chatId}.`);
     } catch (error) {
         console.error(`Failed to summarize history for ${chatId}:`, error);
@@ -1199,8 +1261,22 @@ async function sendRequestToGroup(groupId, requestData, routingType) {
     const groupName = routingType === 'GENERAL' ? 'Общие вопросы' : 
                      routingType === 'ACCOUNTING' ? 'Бухгалтерия' : 'Администрация';
     
+    // Get current timestamp
+    const now = new Date();
+    const timeString = now.toLocaleTimeString('ru-RU', {
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+    const dateString = now.toLocaleDateString('ru-RU', {
+        day: 'numeric',
+        month: 'short',
+        weekday: 'short'
+    });
+    const creationTime = `${timeString} (${dateString})`;
+    
     const requestMessage = `🔔 *Новый запрос - ${groupName}*\n\n` +
                           `🆔 *Номер заявки:* ${shortRequestId}\n` +
+                          `📅 *Время создания:* ${creationTime}\n\n` +
                           `📍 *Адрес:* ${requestData.address}\n` +
                           `📞 *Контакт:* ${requestData.contact}\n` +
                           `❗ *Проблема:* ${requestData.issue}\n` +

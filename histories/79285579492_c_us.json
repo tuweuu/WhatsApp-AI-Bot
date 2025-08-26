@@ -1,0 +1,16 @@
+[
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Добрый день",
+    "timestamp": 1755870132952,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Подскажите, будет удобно внести сегодня оплату по тех обслуживанию?",
+    "timestamp": 1755870159663,
+    "isLiveOperator": true
+  }
+]

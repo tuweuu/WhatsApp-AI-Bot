@@ -4,7 +4,7 @@ const fs = require('fs').promises;
 const path = require('path');
 
 // Configuration for fuzzy matching
-const SIMILARITY_THRESHOLD = 0.7; // Minimum similarity score for matches
+const SIMILARITY_THRESHOLD = 0.8; // Minimum similarity score for matches
 const ADDRESS_SIMILARITY_THRESHOLD = 0.8; // Higher threshold for address matching
 
 class ExcelParser {

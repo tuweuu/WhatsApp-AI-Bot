@@ -1,0 +1,33 @@
+[
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Здравствуйте",
+    "timestamp": 1755860852339,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Гапцахская 12, 4 подъезд. Лифт не работает",
+    "timestamp": 1755860865373,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Отправьте пожалуйста механика",
+    "timestamp": 1755860871461,
+    "isLiveOperator": true
+  },
+  {
+    "role": "user",
+    "type": "text",
+    "content": "Здравствуйте"
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Чем мы можем вам помочь? Пожалуйста, опишите ваш вопрос или проблему более подробно."
+  }
+]

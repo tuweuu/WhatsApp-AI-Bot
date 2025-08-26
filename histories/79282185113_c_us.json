@@ -1,0 +1,30 @@
+[
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Здравствуйте",
+    "timestamp": 1755862320362,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "",
+    "timestamp": 1755862348461,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Кондиционер ваш?",
+    "timestamp": 1755862357185,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Конденсат капает вниз, вам надо будет провести трубку к водоотводной трубе, которая справа находится. И под фасадом необходимо будет это сделать",
+    "timestamp": 1755862481650,
+    "isLiveOperator": true
+  }
+]

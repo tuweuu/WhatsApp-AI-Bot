@@ -1,0 +1,30 @@
+[
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Здравствуйте, 3п, 12 этаж.",
+    "timestamp": 1755851273159,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Когда планируете вывезти мусор?",
+    "timestamp": 1755851273569,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Жильцы жалуются уже",
+    "timestamp": 1755851273812,
+    "isLiveOperator": true
+  },
+  {
+    "role": "assistant",
+    "type": "text",
+    "content": "Хорошо, не подводите пожалуйста",
+    "timestamp": 1755851697102,
+    "isLiveOperator": true
+  }
+]
