@@ -1,2 +1,3 @@
-2025/08/21-15:35:25.547 f703 Creating DB /Users/m/kristina/whatsapp-ai-bot/auth-sessions/kristina/session-kristina/Default/shared_proto_db since it was missing.
-2025/08/21-15:35:25.555 f703 Reusing MANIFEST /Users/m/kristina/whatsapp-ai-bot/auth-sessions/kristina/session-kristina/Default/shared_proto_db/MANIFEST-000001
+2025/08/28-20:29:07.745 700f Reusing MANIFEST /Users/m/kristina/whatsapp-ai-bot/auth-sessions/kristina/session-kristina/Default/shared_proto_db/MANIFEST-000001
+2025/08/28-20:29:07.745 700f Recovering log #3
+2025/08/28-20:29:07.745 700f Reusing old log /Users/m/kristina/whatsapp-ai-bot/auth-sessions/kristina/session-kristina/Default/shared_proto_db/000003.log 

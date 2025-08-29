@@ -34,6 +34,8 @@ Thumbs.db
 .wwebjs_cache/
 .wwebjs_auth/
 history.json
+auth-sessions/
+histories/
 
 # Spreadsheet data files (binary)
 *.xlsx

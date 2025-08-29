@@ -75,6 +75,7 @@ let excelParser = null;
 const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
+let pendingRequests = {}; // Store pending requests waiting for confirmation
 
 // --- TYPING HELPERS (context7 timings) ---
 function calculateTypingDurationMs(text) {
@@ -227,8 +228,10 @@ async function saveHistory(chatId = null) {
     } else {
         // Save all chats in memory (for backward compatibility)
         const chatIds = historyManager.getAllChatIds();
-        for (const id of chatIds) {
-            await historyManager.saveChatHistory(id);
+        if (chatIds && Array.isArray(chatIds)) {
+            for (const id of chatIds) {
+                await historyManager.saveChatHistory(id);
+            }
         }
     }
 }
@@ -539,10 +542,8 @@ async function processBatchedMessages(chatId) {
     
     const history = await historyManager.getHistory(chatId);
     
-    // Add all buffered messages to history
-    for (const messageData of messages) {
-        history.push(messageData.userHistoryEntry);
-    }
+    // Note: User messages are already saved to history immediately when received
+    // So we don't need to add them to history again here
     
     try {
         
@@ -585,54 +586,35 @@ async function processBatchedMessages(chatId) {
                 return;
             }
             
-            // Format and send request to appropriate group
+            // Format request data but don't send yet - show for confirmation first
             const requestData = await formatRequestForGroup(history, chatId, routingType);
             
-            let groupId;
-            switch (routingType) {
-                case 'GENERAL':
-                    groupId = GENERAL_GROUP_ID;
-                    break;
-                case 'ACCOUNTING':
-                    groupId = ACCOUNTING_GROUP_ID;
-                    break;
-                case 'ADMIN':
-                    groupId = ADMIN_GROUP_ID;
-                    break;
+            // Store the pending request
+            pendingRequests[chatId] = {
+                requestData,
+                routingType,
+                history: [...history], // Make a copy
+                combinedContext,
+                timestamp: Date.now()
+            };
+            
+            // Remove the system context message if we added one
+            if (combinedContext) {
+                history.pop();
             }
             
-            const requestResult = await sendRequestToGroup(groupId, requestData, routingType);
+            // Show collected data for confirmation
+            const confirmationMessage = await formatConfirmationMessage(requestData, routingType, history);
             
-            if (requestResult.success) {
-                // Remove the system context message if we added one
-                if (combinedContext) {
-                    history.pop();
-                }
-                
-                let confirmationMessage;
-                const workingHours = isWorkingHours();
-                const contactTime = workingHours ? 'в ближайшее время' : 'в рабочее время';
-                
-                if (routingType === 'GENERAL') {
-                    confirmationMessage = `Ваш запрос передан в службу управления домом.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nПри необходимости - специалист свяжется с вами ${contactTime}.`;
-                } else if (routingType === 'ACCOUNTING') {
-                    confirmationMessage = `Ваш запрос передан в бухгалтерию.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nСпециалист свяжется с вами ${contactTime}.`;
-                } else if (routingType === 'ADMIN') {
-                    confirmationMessage = `Ваш запрос передан для подключения живого ассистента.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nС вами свяжутся ${contactTime}.`;
-                    // For admin routing, disable AI responses for this user
-                    await muteChat(chatId, '24h');
-                }
-                
-                history.push({ role: "assistant", type: 'text', content: confirmationMessage });
-                await historyManager.updateHistory(chatId, history);
-                
-                const lastMessage = messages[messages.length - 1].originalMessage;
-                await sendReplyWithTyping(lastMessage, confirmationMessage);
-                
-                // Clear the buffer
-                messageBuffers[chatId] = [];
-                return;
-            }
+            history.push({ role: "assistant", type: 'text', content: confirmationMessage });
+            await historyManager.updateHistory(chatId, history);
+            
+            const lastMessage = messages[messages.length - 1].originalMessage;
+            await sendReplyWithTyping(lastMessage, confirmationMessage);
+            
+            // Clear the buffer
+            messageBuffers[chatId] = [];
+            return;
         }
         
         const aiResponse = await getOpenAIResponse(history);
@@ -809,10 +791,23 @@ client.on('message', async message => {
         if (messageDebouncers[message.from]) {
             messageDebouncers[message.from].cancel();
         }
+        // Clear any pending request confirmations
+        delete pendingRequests[message.from];
         await saveHistory();
         console.log(`History for ${message.from} has been reset.`);
         await sendReplyWithTyping(message, "I've cleared our previous conversation. Let's start fresh.");
         return;
+    }
+    
+    // Check if this is a confirmation response to a pending request
+    if (pendingRequests[message.from]) {
+        const confirmation = await analyzeConfirmationResponse(messageBody);
+        if (confirmation) {
+            const processed = await processConfirmationResponse(message.from, confirmation, message);
+            if (processed) {
+                return; // Confirmation was processed, don't continue with normal flow
+            }
+        }
     }
 
     try {
@@ -900,9 +895,11 @@ client.on('message', async message => {
             userHistoryEntry = { role: "user", type: 'text', content: messageBody };
         }
 
-        // If chat is muted, store to history and do not reply/buffer
+        // Save user message immediately when received (before processing/debouncing)
+        await historyManager.addMessage(message.from, userHistoryEntry);
+
+        // If chat is muted, do not reply/buffer (but message is already saved above)
         if (isChatMuted(message.from)) {
-            await historyManager.addMessage(message.from, userHistoryEntry);
             return;
         }
 
@@ -1149,19 +1146,22 @@ async function analyzeRequestCompleteness(history, routingType) {
     const COMPLETENESS_PROMPT = `Analyze the conversation history to determine if there is enough information to create a complete ${routingType.toLowerCase()} request.
 
 For a GENERAL request (complaints, repairs, emergencies), check if the following information is available:
-1. Clear description of the problem/issue
-2. Location details (apartment number, floor, specific area)
+1. Full name (ФИО) of the person making the request
+2. Clear description of the problem/issue
+3. Location details (apartment number, floor, specific area)
 4. Any relevant context (when it started, frequency, etc.)
 
 For an ACCOUNTING request (documents, receipts, financial), check if:
-1. Basic document type mentioned (квитанция, справка, документ)
-2. General timeframe if relevant (не обязательно точные даты)
+1. Full name (ФИО) of the person making the request
+2. Basic document type mentioned (квитанция, справка, документ)
+3. General timeframe if relevant (не обязательно точные даты)
 For simple document requests like receipts - minimal information is sufficient.
 
 For an ADMIN request, check if:
-1. Clear description of the complex issue
-2. Previous attempts to resolve
-3. Specific assistance needed
+1. Full name (ФИО) of the person making the request
+2. Clear description of the complex issue
+3. Previous attempts to resolve
+4. Specific assistance needed
 
 Return JSON with:
 - "complete": true/false
@@ -1276,11 +1276,11 @@ async function sendRequestToGroup(groupId, requestData, routingType) {
     
     const requestMessage = `🔔 *Новый запрос - ${groupName}*\n\n` +
                           `🆔 *Номер заявки:* ${shortRequestId}\n` +
-                          `📅 *Время создания:* ${creationTime}\n\n` +
-                          `📍 *Адрес:* ${requestData.address}\n` +
-                          `📞 *Контакт:* ${requestData.contact}\n` +
-                          `❗ *Проблема:* ${requestData.issue}\n` +
-                          `📝 *Детали:* ${requestData.details}`;
+                          ` *Время создания:* ${creationTime}\n\n` +
+                          ` *Адрес:* ${requestData.address}\n` +
+                          ` *Контакт:* ${requestData.contact}\n` +
+                          ` *Проблема:* ${requestData.issue}\n` +
+                          ` *Детали:* ${requestData.details}`;
 
     try {
         await client.sendMessage(groupId, requestMessage);
@@ -1291,6 +1291,233 @@ async function sendRequestToGroup(groupId, requestData, routingType) {
         return { success: false, requestId: null };
     }
 }
+
+// --- CONFIRMATION HANDLING FUNCTIONS ---
+
+/**
+ * Formats a confirmation message showing collected request data
+ * @param {Object} requestData - The formatted request data
+ * @param {string} routingType - The type of routing (GENERAL, ACCOUNTING, ADMIN)
+ * @param {Array} history - The conversation history to extract full name
+ * @returns {Promise<string>} The formatted confirmation message
+ */
+async function formatConfirmationMessage(requestData, routingType, history) {
+    const typeNames = {
+        'GENERAL': 'службу управления домом',
+        'ACCOUNTING': 'бухгалтерию',
+        'ADMIN': 'администрацию для подключения живого ассистента'
+    };
+    
+    const typeName = typeNames[routingType] || 'службу поддержки';
+    
+    // Extract full name from conversation history
+    let fullName = 'Не указано';
+    try {
+        const extractionCompletion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: "Extract the full name mentioned in this conversation. Return only the name, or 'Не указано' if no name is found." },
+                ...history.map(m => ({role: m.role, content: m.content}))
+            ],
+            max_tokens: 50
+        });
+        const extractedName = extractionCompletion.choices[0].message.content.trim();
+        if (extractedName && extractedName !== 'Не указано' && extractedName.length > 2) {
+            fullName = extractedName;
+        }
+    } catch (error) {
+        console.error('Error extracting full name for confirmation:', error);
+    }
+    
+    return `📋 *Проверьте данные перед отправкой в ${typeName}:*\n\n` +
+           `👤 *ФИО:* ${fullName}\n` +
+           `📍 *Адрес:* ${requestData.address}\n` +
+           `❗ *Проблема:* ${requestData.issue}\n` +
+           `📝 *Детали:* ${requestData.details}\n\n` +
+           `❓ *Данные корректны?* Ответьте "да" или "нет".`;
+}
+
+/**
+ * Uses AI to analyze if a message contains confirmation (yes/no) by understanding context and intent
+ * @param {string} messageText - The user's message text
+ * @param {Array} conversationHistory - Recent conversation history for context
+ * @returns {Promise<string|null>} 'yes', 'no', or null if not a confirmation
+ */
+async function analyzeConfirmationResponse(messageText) {
+    const CONFIRMATION_ANALYSIS_PROMPT = `Analyze if the user's response is confirming or denying the data shown to them.
+
+Context: The bot just showed collected data to the user and asked "Данные корректны? Ответьте да или нет" (Are the data correct? Answer yes or no).
+
+User's response: "${messageText}"
+
+Determine if this is:
+1. CONFIRMATION (yes) - User agrees the data is correct, wants to proceed
+2. DENIAL (no) - User disagrees with the data, wants to make changes  
+3. NOT_A_CONFIRMATION (null) - User is asking something else, changing topic, or being ambiguous
+
+IMPORTANT: Compound positive responses should be "yes":
+- "да, верно" → yes (not no!)
+- "да, правильно" → yes
+- "да, хорошо" → yes
+- "да, все так" → yes
+
+ONLY mixed responses with contradictions should be "no":
+- "да, но адрес неправильный" → no (contradiction)
+- "да, только имя не то" → no (exception/problem)
+
+Consider:
+- Intent behind the message, not just keywords
+- Context of data verification
+- Natural language variations in Russian and English
+- Pure positive compounds (да + positive word) = yes
+- Mixed responses with "но/только/except/but" = no
+- Questions or off-topic responses should be "null"
+
+Examples:
+- "да" → yes
+- "да, верно" → yes
+- "да, правильно" → yes  
+- "yes, correct" → yes  
+- "все правильно" → yes
+- "нет" → no
+- "да, но адрес неправильный" → no
+- "no, the address is wrong" → no
+- "не согласен с адресом" → no
+- "А когда будет готово?" → null
+- "Спасибо" → null
+- "может быть" → null
+
+Respond with exactly one word: "yes", "no", or "null"`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: CONFIRMATION_ANALYSIS_PROMPT },
+                { role: "user", content: messageText }
+            ],
+            max_tokens: 10,
+            temperature: 0.1 // Low temperature for consistent responses
+        });
+
+        const response = completion.choices[0].message.content.trim().toLowerCase();
+        
+        if (response === 'yes') return 'yes';
+        if (response === 'no') return 'no';
+        if (response === 'null') return null;
+        
+        // Fallback: if AI returns unexpected response, default to null (not a confirmation)
+        console.warn(`Unexpected AI confirmation analysis response: ${response}. Defaulting to null.`);
+        return null;
+        
+    } catch (error) {
+        console.error('Error analyzing confirmation response:', error);
+        // Fallback to basic keyword detection if AI fails
+        return basicConfirmationFallback(messageText);
+    }
+}
+
+/**
+ * Fallback confirmation detection using basic patterns (used if AI fails)
+ * @param {string} messageText - The user's message text
+ * @returns {string|null} 'yes', 'no', or null
+ */
+function basicConfirmationFallback(messageText) {
+    const text = messageText.toLowerCase().trim();
+    
+    // Very basic patterns as fallback
+    if (['да', 'yes', 'ок', 'ok'].includes(text)) {
+        return 'yes';
+    }
+    
+    if (['нет', 'no'].includes(text)) {
+        return 'no';
+    }
+    
+    return null;
+}
+
+/**
+ * Processes the user's confirmation response
+ * @param {string} chatId - The chat ID
+ * @param {string} confirmation - 'yes' or 'no'
+ * @param {Object} message - The original WhatsApp message
+ */
+async function processConfirmationResponse(chatId, confirmation, message) {
+    const pendingRequest = pendingRequests[chatId];
+    if (!pendingRequest) {
+        return false;
+    }
+    
+    if (confirmation === 'yes') {
+        // User confirmed - proceed with sending the request
+        const { requestData, routingType, history } = pendingRequest;
+        
+        let groupId;
+        switch (routingType) {
+            case 'GENERAL':
+                groupId = GENERAL_GROUP_ID;
+                break;
+            case 'ACCOUNTING':
+                groupId = ACCOUNTING_GROUP_ID;
+                break;
+            case 'ADMIN':
+                groupId = ADMIN_GROUP_ID;
+                break;
+        }
+        
+        const requestResult = await sendRequestToGroup(groupId, requestData, routingType);
+        
+        if (requestResult.success) {
+            let successMessage;
+            const workingHours = isWorkingHours();
+            const contactTime = workingHours ? 'в ближайшее время' : 'в рабочее время';
+            
+            if (routingType === 'GENERAL') {
+                successMessage = `✅ Ваш запрос передан в службу управления домом.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nПри необходимости - специалист свяжется с вами ${contactTime}.`;
+            } else if (routingType === 'ACCOUNTING') {
+                successMessage = `✅ Ваш запрос передан в бухгалтерию.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nСпециалист свяжется с вами ${contactTime}.`;
+            } else if (routingType === 'ADMIN') {
+                successMessage = `✅ Ваш запрос передан для подключения живого ассистента.\n\n🆔 *Номер вашей заявки: ${requestResult.requestId}*\n\nС вами свяжутся ${contactTime}.`;
+                // For admin routing, disable AI responses for this user
+                await muteChat(chatId, 24 * 60 * 60 * 1000); // 24 hours in milliseconds
+            }
+            
+            history.push({ role: "assistant", type: 'text', content: successMessage });
+            await historyManager.updateHistory(chatId, history);
+            await sendReplyWithTyping(message, successMessage);
+        } else {
+            const errorMessage = 'Произошла ошибка при отправке заявки. Пожалуйста, обратитесь в офис по номеру +7 (800) 444-52-05.';
+            history.push({ role: "assistant", type: 'text', content: errorMessage });
+            await historyManager.updateHistory(chatId, history);
+            await sendReplyWithTyping(message, errorMessage);
+        }
+    } else {
+        // User declined - ask what needs to be corrected
+        const correctionMessage = 'Хорошо, расскажите что нужно исправить или дополнить в вашем запросе.';
+        const history = await historyManager.getHistory(chatId);
+        history.push({ role: "assistant", type: 'text', content: correctionMessage });
+        await historyManager.updateHistory(chatId, history);
+        await sendReplyWithTyping(message, correctionMessage);
+    }
+    
+    // Clean up the pending request
+    delete pendingRequests[chatId];
+    return true;
+}
+
+// Clean up expired pending requests every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    const expireTime = 10 * 60 * 1000; // 10 minutes
+    
+    for (const [chatId, request] of Object.entries(pendingRequests)) {
+        if (now - request.timestamp > expireTime) {
+            delete pendingRequests[chatId];
+            console.log(`Expired pending request for ${chatId}`);
+        }
+    }
+}, 5 * 60 * 1000);
 
 // --- ACCOUNT LOOKUP FUNCTIONS ---
 
@@ -1314,7 +1541,6 @@ async function handleAccountLookup(chatId, history) {
         const extractedData = JSON.parse(extractionCompletion.choices[0].message.content);
 
         const { fullName, address } = extractedData;
-        const phone = `+${chatId.split('@')[0]}`;
 
         if (fullName && address) {
             console.log(`Looking up account for: ${fullName} at ${address}`);
