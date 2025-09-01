@@ -101,12 +101,7 @@ class HistoryManager {
         // Auto-save after adding message
         await this.saveChatHistory(chatId);
         
-        // Check if summarization is needed
-        if (this.conversationHistories[chatId].length > this.maxHistoryLength) {
-            console.log(`History for ${chatId} exceeds limit. Triggering summarization.`);
-            return true; // Indicates summarization needed
-        }
-        
+        // Summarization logic is handled in the main processing flow
         return false;
     }
 

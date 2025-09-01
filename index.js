@@ -78,7 +78,7 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
 let pendingRequests = {}; // Store pending requests waiting for confirmation
@@ -655,9 +655,10 @@ async function processBatchedMessages(chatId) {
             await sendReplyWithTyping(lastMessage, aiResponse);
         }
 
-        // Check if summarization is needed (handled by historyManager.addMessage)
-        if (history.length > MAX_HISTORY_LENGTH) {
-            console.log(`History for ${chatId} exceeds limit. Triggering summarization.`);
+        // Check if summarization is needed after processing the batch
+        const currentHistory = await historyManager.getHistory(chatId);
+        if (currentHistory.length === MAX_HISTORY_LENGTH + 1) {
+            console.log(`History for ${chatId} reached limit (${MAX_HISTORY_LENGTH} + 1 = ${currentHistory.length}). Triggering summarization.`);
             await summarizeHistory(chatId);
         }
 

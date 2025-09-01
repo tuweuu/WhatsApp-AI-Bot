@@ -154,13 +154,36 @@ class ExcelParser {
 
         // Normalize the target address for better matching
         const normalizedTarget = this.normalizeAddress(targetAddress);
+        
+        console.log(`Looking for normalized target address: "${normalizedTarget}"`);
 
         for (const address of this.residentsData.keys()) {
             const normalizedAddress = this.normalizeAddress(address);
-            const similarity = this.calculateStringSimilarity(normalizedTarget, normalizedAddress);
             
-            // Use a lower threshold for address matching since addresses can vary significantly
-            if (similarity > bestSimilarity && similarity >= 0.6) {
+            // Try different matching approaches
+            let similarity = 0;
+            
+            // 1. Direct string similarity
+            const directSimilarity = this.calculateStringSimilarity(normalizedTarget, normalizedAddress);
+            
+            // 2. Check if key address components match (street name + house number)
+            const targetParts = normalizedTarget.split(/\s+/).filter(p => p.length > 0);
+            const addressParts = normalizedAddress.split(/\s+/).filter(p => p.length > 0);
+            
+            // Try to find matching street name and house number
+            const hasMatchingStreetAndNumber = this.hasMatchingStreetAndNumber(targetParts, addressParts);
+            
+            if (hasMatchingStreetAndNumber) {
+                // Boost similarity if street name and number match
+                similarity = Math.max(directSimilarity, 0.8);
+            } else {
+                similarity = directSimilarity;
+            }
+            
+            console.log(`Comparing "${normalizedTarget}" with "${normalizedAddress}": similarity = ${similarity}`);
+            
+            // Use balanced threshold - flexible but not too loose
+            if (similarity > bestSimilarity && similarity >= 0.65) {
                 bestSimilarity = similarity;
                 bestMatch = address;
             }
@@ -168,6 +191,43 @@ class ExcelParser {
 
         console.log(`Best address match: "${bestMatch}" with similarity: ${bestSimilarity}`);
         return bestMatch;
+    }
+
+    /**
+     * Check if target address has matching street name and house number
+     */
+    hasMatchingStreetAndNumber(targetParts, addressParts) {
+        // Look for house numbers (numeric parts)
+        const targetNumbers = targetParts.filter(p => /\d/.test(p));
+        const addressNumbers = addressParts.filter(p => /\d/.test(p));
+        
+        // Must have at least one matching number
+        const hasMatchingNumber = targetNumbers.some(tNum => 
+            addressNumbers.some(aNum => {
+                const tClean = tNum.replace(/[^\d]/g, '');
+                const aClean = aNum.replace(/[^\d]/g, '');
+                return tClean === aClean || (tClean.length > 0 && aClean.length > 0 && 
+                    (tClean.includes(aClean) || aClean.includes(tClean)));
+            })
+        );
+        
+        if (!hasMatchingNumber) {
+            return false;
+        }
+        
+        // Look for matching street name parts (non-numeric)
+        const targetStreets = targetParts.filter(p => !/^\d+[а-я]*$/.test(p) && p.length > 2);
+        const addressStreets = addressParts.filter(p => !/^\d+[а-я]*$/.test(p) && p.length > 2);
+        
+        // Check if any street name parts match
+        const hasMatchingStreet = targetStreets.some(tStreet => 
+            addressStreets.some(aStreet => {
+                const streetSimilarity = this.calculateStringSimilarity(tStreet, aStreet);
+                return streetSimilarity > 0.75;
+            })
+        );
+        
+        return hasMatchingStreet;
     }
 
     /**
@@ -180,11 +240,23 @@ class ExcelParser {
             .toLowerCase()
             .replace(/[.,]/g, ' ')  // Replace punctuation with spaces
             .replace(/\s+/g, ' ')   // Normalize whitespace
-            .replace(/магомет/g, 'м')  // Handle "Магомет" -> "М"
-            .replace(/гаджиева?/g, 'гаджиева')  // Normalize "Гаджиева"
+            // Handle common street name variations
+            .replace(/магомет\s*гаджиев/g, 'м гаджиев')  // Handle "Магомет Гаджиев" -> "М Гаджиев"
+            .replace(/магомеда?\s*гаджиев/g, 'м гаджиев')  // Handle "Магомеда Гаджиев" -> "М Гаджиев"
+            .replace(/гаджиева?/g, 'гаджиев')  // Normalize "Гаджиева"
+            .replace(/а[\.\s]*кадыров/g, 'кадыров')  // Handle "А.Кадырова" -> "Кадырова"
+            .replace(/ахмат[\.\s-]*кадыров/g, 'кадыров')  // Handle "Ахмат-Кадырова" -> "Кадырова"
+            // Remove common prefixes
+            .replace(/^(ул|улица)[\.\s]*/g, '')  // Remove "ул." or "улица" prefix
             .replace(/д\.?\s*/g, '')  // Remove "д." prefix
+            .replace(/дом\s*/g, '')  // Remove "дом" prefix
             .replace(/кв\.?\s*/g, '')  // Remove "кв." prefix
+            .replace(/квартира\s*/g, '')  // Remove "квартира" prefix
+            .replace(/г\.?\s*/g, '')  // Remove "г." prefix
+            .replace(/город\s*/g, '')  // Remove "город" prefix
+            // Remove trailing single letters and normalize
             .replace(/[а-я]$/g, '')  // Remove single letter suffixes like "а"
+            .replace(/\s+/g, ' ')   // Normalize whitespace again
             .trim();
     }
 
