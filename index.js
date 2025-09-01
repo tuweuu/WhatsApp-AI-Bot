@@ -20,6 +20,12 @@ const OPENAI_MODEL = "gpt-4.1";
 const MAX_HISTORY_LENGTH = 50;
 const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
 
+// Critical guard: confirmation is handled by our code, not the LLM
+const CONFIRMATION_DELEGATION_RULES = `ВАЖНО:
+— Никогда не проси пользователя подтвердить данные фразами вида «подтвердите/да или нет/если верно оформлю/передам заявку».
+— Не обещай самостоятельно «оформлю/передам заявку/отправлю в бухгалтерию/администрацию».
+— Подтверждение и отправка заявок выполняются системой. Твоя задача — собрать недостающие данные короткими вопросами. Если данных достаточно — не запрашивай подтверждение, отвечай по существу и жди дальнейших действий системы.`;
+
 const ACCOUNT_EXTRACTION_PROMPT = "Analyze the ENTIRE conversation history and extract the full name and complete address for the person whose account is being requested. This could be the user themselves or someone they're asking about (like a family member). Information may be provided across multiple messages. Look for: 1) Full name (first name, last name) - may be provided in parts across different messages 2) Complete address including street name, house number, and apartment number - may also be provided in parts. Combine all address parts into a single address string. Return the data in JSON format with the keys: 'fullName' and 'address'. If any information is missing, use the value 'null'. Examples: fullName: 'Адакова Валерия Аликовна', address: 'Магомеда Гаджиева 73а, кв. 92'. Pay special attention to: - Names that may be provided as 'адакова валерия' first, then 'Адакова Валерия Аликовна' later - Addresses like 'магомед гаджиева 73а, 92кв' or 'магомед гаджиева 73а' + '92кв' separately";
 
 // --- GROUP ROUTING INTEGRATION ---
@@ -72,7 +78,7 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
 let pendingRequests = {}; // Store pending requests waiting for confirmation
@@ -807,6 +813,14 @@ client.on('message', async message => {
             if (processed) {
                 return; // Confirmation was processed, don't continue with normal flow
             }
+        } else {
+            // Check if user changed topics or ignored confirmation
+            const topicChange = await detectTopicChange(messageBody, pendingRequests[message.from]);
+            if (topicChange) {
+                console.log(`Topic change detected for ${message.from}, clearing pending confirmation`);
+                delete pendingRequests[message.from];
+                // Continue with normal message processing
+            }
         }
     }
 
@@ -1062,7 +1076,7 @@ async function getOpenAIResponse(richHistory) {
 
         // Add current date/time context to the system prompt
         const dateTimeContext = getCurrentDateTimeContext();
-        const enhancedSystemPrompt = `${SYSTEM_PROMPT}\n\n${dateTimeContext}`;
+        const enhancedSystemPrompt = `${SYSTEM_PROMPT}\n\n${CONFIRMATION_DELEGATION_RULES}\n\n${dateTimeContext}`;
 
         const completion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
@@ -1116,14 +1130,16 @@ DO NOT route if the user is:
 
 ONLY route if there is a NEW, SPECIFIC request for:
 1. GENERAL - Complaints, emergencies, repairs, maintenance issues, building problems, utilities, heating, water, electricity, elevators, cleaning, security, noise complaints
-2. ACCOUNTING - Documentation requests, receipts, payment issues, account statements, billing questions, payment confirmations, salary and financial matters (BUT NOT account number lookup requests - those are handled automatically)
+2. ACCOUNTING - Documentation requests, receipts, payment issues, account statements, billing questions, payment confirmations, salary and financial matters (BUT NOT account number lookup requests - those are handled automatically). Include phrases like: «расчет начислений», «расчёт за [месяц/период]», «детализация начислений», «подготовьте расчет/расчёт», «свод начислений», «справка по начислениям», «расчет за июнь-июль» — treat these as ACCOUNTING.
 3. ADMIN - When the bot cannot help, gets stuck, requires human intervention, or when the user is frustrated with automated responses
 
 DO NOT route account number/лицевой счет lookup requests - the bot handles these automatically with Excel data.
 
 Return ONLY one word: GENERAL, ACCOUNTING, ADMIN, or NONE
 
-If this is just a thank you, question, or casual response - return NONE.`;
+If this is just a thank you, question, or casual response - return NONE.
+
+Important: Do NOT propose confirmations or say anything about sending/forwarding a request; just classify.`;
 
     try {
         const completion = await openai.chat.completions.create({
@@ -1145,30 +1161,34 @@ If this is just a thank you, question, or casual response - return NONE.`;
 async function analyzeRequestCompleteness(history, routingType) {
     const COMPLETENESS_PROMPT = `Analyze the conversation history to determine if there is enough information to create a complete ${routingType.toLowerCase()} request.
 
+CRITICAL: For ALL request types, the user's FULL NAME (фамилия и имя) is MANDATORY and must be clearly stated in the conversation. Both surname and first name are required.
+
 For a GENERAL request (complaints, repairs, emergencies), check if the following information is available:
-1. Full name (ФИО) of the person making the request
+1. FULL NAME (фамилия и имя) of the person making the request - REQUIRED, must include both surname and first name
 2. Clear description of the problem/issue
 3. Location details (apartment number, floor, specific area)
 4. Any relevant context (when it started, frequency, etc.)
 
 For an ACCOUNTING request (documents, receipts, financial), check if:
-1. Full name (ФИО) of the person making the request
+1. FULL NAME (фамилия и имя) of the person making the request - REQUIRED, must include both surname and first name
 2. Basic document type mentioned (квитанция, справка, документ)
 3. General timeframe if relevant (не обязательно точные даты)
 For simple document requests like receipts - minimal information is sufficient.
 
 For an ADMIN request, check if:
-1. Full name (ФИО) of the person making the request
+1. FULL NAME (фамилия и имя) of the person making the request - REQUIRED, must include both surname and first name
 2. Clear description of the complex issue
 3. Previous attempts to resolve
 4. Specific assistance needed
+
+IMPORTANT: If the full name is missing or incomplete (only first name, only surname, etc.), the request is NOT complete. Both surname and first name are required.
 
 Return JSON with:
 - "complete": true/false
 - "missing_info": array of missing information types
 - "clarifying_questions": array of specific questions to ask (max 2 questions)
 
-If information is incomplete, suggest clarifying questions that would help gather the missing details.`;
+If the full name is missing, always include a question asking for it specifically: "Укажите ваши фамилию и имя"`;
 
     try {
         const completion = await openai.chat.completions.create({
@@ -1201,13 +1221,19 @@ If information is incomplete, suggest clarifying questions that would help gathe
 async function formatRequestForGroup(history, chatId, routingType) {
     const FORMATTING_PROMPT = `Analyze the conversation history and extract the following information for a ${routingType.toLowerCase()} request:
 
-1. Address: Extract the full house address mentioned in the conversation
-2. Contact: The phone number (should start with +7, without c.us)
-3. Issue: Brief description of the reason for the request (one sentence)
-4. Details: More information about the issue, but concise - maximum 40 words. Focus ONLY on the most recent relevant request, do not mix different requests.
+1. Full Name: Extract the complete name (surname and first name) of the person making the request
+2. Address: Extract the full house address mentioned in the conversation
+3. Contact: The phone number (should start with +7, without c.us)
+4. Issue: Brief description of the reason for the request (one sentence)
+5. Details: More information about the issue, but concise - maximum 40 words. Focus ONLY on the most recent relevant request, do not mix different requests.
 
-Return the data in JSON format with keys: 'address', 'contact', 'issue', 'details'
+Return the data in JSON format with keys: 'fullName', 'address', 'contact', 'issue', 'details'
 If any information is missing, use 'Не указано' for that field.
+
+Formatting rules:
+- 'address' must be a clean postal address string only (e.g., "Магомеда Гаджиева 73а, кв. 92"). Do not include лишние пояснения в скобках, даты, чужие адреса, слова вроде "бывший".
+- 'issue' should be one short sentence (no prefixes like "Заявка на" or "Просьба"), only the essence.
+- 'details' should be concise (<=40 words) and refer only to the most recent request topic, without duplicating 'issue'.
 
 Important: For details, analyze only the latest request topic and provide focused information without mixing different issues.`;
 
@@ -1229,6 +1255,7 @@ Important: For details, analyze only the latest request topic and provide focuse
         const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
         
         return {
+            fullName: extractedData.fullName || 'Не указано',
             address: extractedData.address || 'Не указано',
             contact: cleanContact,
             issue: extractedData.issue || 'Не указано',
@@ -1240,6 +1267,7 @@ Important: For details, analyze only the latest request topic and provide focuse
         const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
         
         return {
+            fullName: 'Не указано',
             address: 'Не указано',
             contact: cleanContact,
             issue: 'Требуется обработка запроса',
@@ -1277,6 +1305,7 @@ async function sendRequestToGroup(groupId, requestData, routingType) {
     const requestMessage = `🔔 *Новый запрос - ${groupName}*\n\n` +
                           `🆔 *Номер заявки:* ${shortRequestId}\n` +
                           ` *Время создания:* ${creationTime}\n\n` +
+                          ` *ФИО:* ${requestData.fullName}\n` +
                           ` *Адрес:* ${requestData.address}\n` +
                           ` *Контакт:* ${requestData.contact}\n` +
                           ` *Проблема:* ${requestData.issue}\n` +
@@ -1310,20 +1339,22 @@ async function formatConfirmationMessage(requestData, routingType, history) {
     
     const typeName = typeNames[routingType] || 'службу поддержки';
     
-    // Extract full name from conversation history
+    // Extract full name from conversation history (JSON for robustness)
     let fullName = 'Не указано';
     try {
         const extractionCompletion = await openai.chat.completions.create({
             model: OPENAI_MODEL,
             messages: [
-                { role: "system", content: "Extract the full name mentioned in this conversation. Return only the name, or 'Не указано' if no name is found." },
+                { role: "system", content: "Извлеки полное ФИО (как одна строка) из этой переписки. Верни строго JSON вида {\"fullName\": \"Иванов Иван Иванович\"}. Если ФИО не найдено — верни {\"fullName\": \"Не указано\"}. Никаких других полей и текста." },
                 ...history.map(m => ({role: m.role, content: m.content}))
             ],
-            max_tokens: 50
+            response_format: { type: "json_object" },
+            max_tokens: 40,
+            temperature: 0.1
         });
-        const extractedName = extractionCompletion.choices[0].message.content.trim();
-        if (extractedName && extractedName !== 'Не указано' && extractedName.length > 2) {
-            fullName = extractedName;
+        const extracted = JSON.parse(extractionCompletion.choices[0].message.content || '{}');
+        if (extracted.fullName && typeof extracted.fullName === 'string' && extracted.fullName.trim().length > 2) {
+            fullName = extracted.fullName.trim();
         }
     } catch (error) {
         console.error('Error extracting full name for confirmation:', error);
@@ -1435,6 +1466,66 @@ function basicConfirmationFallback(messageText) {
     }
     
     return null;
+}
+
+/**
+ * Detects if user has changed topics or is ignoring confirmation request
+ * @param {string} messageText - The user's message text
+ * @param {Object} pendingRequest - The pending request data
+ * @returns {Promise<boolean>} True if topic change detected
+ */
+async function detectTopicChange(messageText, pendingRequest) {
+    const TOPIC_CHANGE_PROMPT = `The bot recently asked the user to confirm request data with "Данные корректны? Ответьте да или нет" (Are the data correct? Answer yes or no).
+
+User's response: "${messageText}"
+
+Determine if this is a TOPIC CHANGE where the user:
+1. Started a completely new request/complaint unrelated to the pending confirmation
+2. Asked a different question ignoring the confirmation
+3. Said something dismissive like "не буду ничего проверять", "надоели вы уже", "отвали"
+4. Made a new unrelated complaint or request
+
+Return "true" if this is clearly a topic change that should cancel the pending confirmation.
+Return "false" if this is still related to the confirmation request (corrections, clarifications, etc.)
+
+Examples:
+- "не буду ничего проверять" → true (dismissive)
+- "надоели вы уже" → true (dismissive) 
+- "каждый раз говорите заявку передадим" → true (dismissive)
+- "и ничего не делаете!" → true (dismissive)
+- "У меня другая проблема с лифтом" → true (new request)
+- "Когда починят отопление?" → true (new question)
+- "я не хочу уже создавать заявку!" → true (dismissive)
+- "отвали!" → true (dismissive)
+- "Адрес неправильный" → false (correction)
+- "Не согласен с адресом" → false (clarification)
+- "Можете исправить имя?" → false (correction)
+
+Respond with exactly one word: "true" or "false"`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: TOPIC_CHANGE_PROMPT },
+                { role: "user", content: messageText }
+            ],
+            max_tokens: 5,
+            temperature: 0.1
+        });
+
+        const response = completion.choices[0].message.content.trim().toLowerCase();
+        return response === 'true';
+        
+    } catch (error) {
+        console.error('Error detecting topic change:', error);
+        // Fallback: detect basic dismissive patterns
+        const dismissivePatterns = [
+            'надоел', 'отвал', 'не буду', 'не хочу', 'каждый раз', 'ничего не дела'
+        ];
+        const text = messageText.toLowerCase();
+        return dismissivePatterns.some(pattern => text.includes(pattern));
+    }
 }
 
 /**
