@@ -78,10 +78,11 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
 let pendingRequests = {}; // Store pending requests waiting for confirmation
+let residentDataCache = {}; // Cache extracted resident data to avoid re-asking
 
 // --- TYPING HELPERS (context7 timings) ---
 function calculateTypingDurationMs(text) {
@@ -474,6 +475,52 @@ async function handlePdf(media) {
     }
 }
 
+// --- PAYMENT DATA EXTRACTION FUNCTION ---
+async function extractPaymentData(pdfContent, filename) {
+    const PAYMENT_EXTRACTION_PROMPT = `Analyze the PDF content and extract payment information. Look for:
+1. Sender full name (who is sending the payment) - could be "отправитель", "плательщик", "от кого"
+2. Recipient full name (who is receiving the payment) - could be "получатель", "в пользу", "кому"  
+3. Amount sent - the payment amount with currency
+
+PDF filename: ${filename || 'Unknown'}
+PDF content: ${pdfContent}
+
+Return JSON with keys: 'senderName', 'recipientName', 'amount'
+If any information is not found, use 'Не указано' for that field.
+For amount, include currency if mentioned (e.g., "1500 руб" or "25000₽")
+
+Examples:
+- senderName: "Иванов Иван Петрович"
+- recipientName: "ООО Управляющая Компания Прогресс"  
+- amount: "15000 руб"`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: PAYMENT_EXTRACTION_PROMPT },
+                { role: "user", content: `Extract payment data from this document.` }
+            ],
+            response_format: { type: "json_object" },
+            max_tokens: 200
+        });
+        
+        const extractedData = JSON.parse(completion.choices[0].message.content);
+        return {
+            senderName: extractedData.senderName || 'Не указано',
+            recipientName: extractedData.recipientName || 'Не указано',
+            amount: extractedData.amount || 'Не указано'
+        };
+    } catch (error) {
+        console.error('Error extracting payment data:', error);
+        return {
+            senderName: 'Не указано',
+            recipientName: 'Не указано',
+            amount: 'Не указано'
+        };
+    }
+}
+
 // --- VIDEO HANDLING FUNCTION ---
 async function handleVideo(media) {
     try {
@@ -798,8 +845,9 @@ client.on('message', async message => {
         if (messageDebouncers[message.from]) {
             messageDebouncers[message.from].cancel();
         }
-        // Clear any pending request confirmations
+        // Clear any pending request confirmations and cached data
         delete pendingRequests[message.from];
+        delete residentDataCache[message.from];
         await saveHistory();
         console.log(`History for ${message.from} has been reset.`);
         await sendReplyWithTyping(message, "I've cleared our previous conversation. Let's start fresh.");
@@ -816,7 +864,7 @@ client.on('message', async message => {
             }
         } else {
             // Check if user changed topics or ignored confirmation
-            const topicChange = await detectTopicChange(messageBody, pendingRequests[message.from]);
+            const topicChange = await detectTopicChange(messageBody);
             if (topicChange) {
                 console.log(`Topic change detected for ${message.from}, clearing pending confirmation`);
                 delete pendingRequests[message.from];
@@ -850,7 +898,7 @@ client.on('message', async message => {
                     
                     // Check if this is a payment file and forward to accounting group
                     if (await isPaymentFile(messageBody, media.filename)) {
-                        await forwardPaymentFileToAccounting(message, media);
+                        await forwardPaymentFileToAccounting(message, media, messageBody);
                     }
                 } catch (error) {
                     console.error("Error processing PDF:", error);
@@ -897,7 +945,7 @@ client.on('message', async message => {
                 // Check if unsupported file type might be a payment document
                 if (await isPaymentFileByType(media.mimetype, media.filename)) {
                     console.log(`Received potential payment file: ${media.mimetype}`);
-                    await forwardPaymentFileToAccounting(message, media);
+                    await forwardPaymentFileToAccounting(message, media, null); // No PDF content for non-PDF files
                     userHistoryEntry = { role: "user", type: 'file', content: `Отправлен файл платежа: ${media.filename || 'документ'}`, media: { mimetype: media.mimetype, filename: media.filename } };
                 } else {
                     // Unsupported file type - handle immediately
@@ -1013,11 +1061,12 @@ async function isPaymentFileByType(mimetype, filename) {
 }
 
 /**
- * Forwards a payment file to the accounting group
+ * Forwards a payment file to the accounting group with extracted payment data
  * @param {Object} message - The original WhatsApp message
  * @param {Object} media - The media object containing the file
+ * @param {string} pdfContent - The extracted PDF text content (if available)
  */
-async function forwardPaymentFileToAccounting(message, media) {
+async function forwardPaymentFileToAccounting(message, media, pdfContent = null) {
     if (!ACCOUNTING_GROUP_ID) {
         console.error('ACCOUNTING_GROUP_ID is not configured, cannot forward payment file');
         return;
@@ -1028,12 +1077,27 @@ async function forwardPaymentFileToAccounting(message, media) {
         const phone = `+${message.from.split('@')[0]}`;
         const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
         
+        // Extract payment data if PDF content is available
+        let paymentData = null;
+        if (pdfContent && media.mimetype === 'application/pdf') {
+            console.log('Extracting payment data from PDF...');
+            paymentData = await extractPaymentData(pdfContent, media.filename);
+        }
+        
         // Create message for accounting group
-        const forwardMessage = `💰 *Новый платежный документ*\n\n` +
-                              `📞 *От:* ${cleanContact}\n` +
-                              `📄 *Файл:* ${media.filename || 'Документ'}\n` +
-                              `📅 *Время:* ${new Date().toLocaleString('ru-RU')}\n\n` +
-                              `Пожалуйста, обработайте платежный документ.`;
+        let forwardMessage = `💰 *Новый платежный документ*\n\n` +
+                            `📞 *От:* ${cleanContact}\n` +
+                            `📅 *Время:* ${new Date().toLocaleString('ru-RU')}\n`;
+        
+        // Add extracted payment data if available
+        if (paymentData) {
+            forwardMessage += `\n📊 *Данные платежа:*\n` +
+                             `👤 *Отправитель:* ${paymentData.senderName}\n` +
+                             `🏢 *Получатель:* ${paymentData.recipientName}\n` +
+                             `💵 *Сумма:* ${paymentData.amount}\n`;
+        }
+        
+        forwardMessage += `\nПожалуйста, обработайте платежный документ.`;
         
         // Send text message first
         await client.sendMessage(ACCOUNTING_GROUP_ID, forwardMessage);
@@ -1042,7 +1106,7 @@ async function forwardPaymentFileToAccounting(message, media) {
         const mediaMessage = new MessageMedia(media.mimetype, media.data, media.filename);
         await client.sendMessage(ACCOUNTING_GROUP_ID, mediaMessage);
         
-        console.log(`Payment file forwarded to accounting group from ${message.from}`);
+        console.log(`Payment file forwarded to accounting group from ${message.from}${paymentData ? ' with extracted payment data' : ''}`);
         
     } catch (error) {
         console.error('Error forwarding payment file to accounting:', error);
@@ -1220,6 +1284,59 @@ If the full name is missing, always include a question asking for it specificall
 }
 
 async function formatRequestForGroup(history, chatId, routingType) {
+    // Check if we have cached resident data first
+    const cachedData = residentDataCache[chatId];
+    const cacheAge = cachedData ? (Date.now() - cachedData.timestamp) / (1000 * 60) : Infinity; // age in minutes
+    const cacheValid = cachedData && cacheAge < 30; // Cache valid for 30 minutes
+    
+    const phone = `+${chatId.split('@')[0]}`;
+    const cleanContact = phone.startsWith('+7') ? phone : `+7${phone.replace(/^\+/, '')}`;
+    
+    if (cacheValid) {
+        console.log(`Using cached resident data for ${chatId} (age: ${Math.round(cacheAge)}min)`);
+        
+        // Extract only issue and details from history, use cached data for name/address
+        const ISSUE_EXTRACTION_PROMPT = `Extract only the issue and details for a ${routingType.toLowerCase()} request from the conversation:
+
+1. Issue: Brief description of the current request (one sentence)
+2. Details: Specific information about this request (maximum 40 words)
+
+Return JSON with keys: 'issue', 'details'
+Focus ONLY on the most recent request, not previous topics.`;
+
+        try {
+            const completion = await openai.chat.completions.create({
+                model: OPENAI_MODEL,
+                messages: [
+                    { role: "system", content: ISSUE_EXTRACTION_PROMPT },
+                    ...history.map(m => ({role: m.role, content: m.content}))
+                ],
+                response_format: { type: "json_object" },
+                max_tokens: 150
+            });
+            
+            const extractedIssue = JSON.parse(completion.choices[0].message.content);
+            
+            return {
+                fullName: cachedData.fullName,
+                address: cachedData.address,
+                contact: cleanContact,
+                issue: extractedIssue.issue || 'Не указано',
+                details: extractedIssue.details || 'Не указано'
+            };
+        } catch (error) {
+            console.error('Error extracting issue from cached data:', error);
+            return {
+                fullName: cachedData.fullName,
+                address: cachedData.address,
+                contact: cleanContact,
+                issue: 'Требуется обработка запроса',
+                details: 'Ошибка при извлечении деталей запроса'
+            };
+        }
+    }
+    
+    // Fallback to full extraction if no cached data
     const FORMATTING_PROMPT = `Analyze the conversation history and extract the following information for a ${routingType.toLowerCase()} request:
 
 1. Full Name: Extract the complete name (surname and first name) of the person making the request
@@ -1472,10 +1589,9 @@ function basicConfirmationFallback(messageText) {
 /**
  * Detects if user has changed topics or is ignoring confirmation request
  * @param {string} messageText - The user's message text
- * @param {Object} pendingRequest - The pending request data
  * @returns {Promise<boolean>} True if topic change detected
  */
-async function detectTopicChange(messageText, pendingRequest) {
+async function detectTopicChange(messageText) {
     const TOPIC_CHANGE_PROMPT = `The bot recently asked the user to confirm request data with "Данные корректны? Ответьте да или нет" (Are the data correct? Answer yes or no).
 
 User's response: "${messageText}"
@@ -1598,15 +1714,24 @@ async function processConfirmationResponse(chatId, confirmation, message) {
     return true;
 }
 
-// Clean up expired pending requests every 5 minutes
+// Clean up expired pending requests and cached data every 5 minutes
 setInterval(() => {
     const now = Date.now();
     const expireTime = 10 * 60 * 1000; // 10 minutes
+    const cacheExpireTime = 60 * 60 * 1000; // 1 hour for cached data
     
     for (const [chatId, request] of Object.entries(pendingRequests)) {
         if (now - request.timestamp > expireTime) {
             delete pendingRequests[chatId];
             console.log(`Expired pending request for ${chatId}`);
+        }
+    }
+    
+    // Clean up expired cached resident data
+    for (const [chatId, cachedData] of Object.entries(residentDataCache)) {
+        if (now - cachedData.timestamp > cacheExpireTime) {
+            delete residentDataCache[chatId];
+            console.log(`Expired cached resident data for ${chatId}`);
         }
     }
 }, 5 * 60 * 1000);
@@ -1639,11 +1764,19 @@ async function handleAccountLookup(chatId, history) {
             const accountInfo = excelParser.findResidentAccount(fullName, address);
             
             if (accountInfo) {
+                // Cache the resident data for future use
+                residentDataCache[chatId] = {
+                    fullName: fullName,
+                    address: address,
+                    accountInfo: accountInfo,
+                    timestamp: Date.now()
+                };
+                
                 const accountMessage = `🏠 Найден ваш лицевой счет:\n\n📋 Номер: ${accountInfo.accountNumber}\n👤 ФИО: ${accountInfo.fullName}\n🏠 Квартира: ${accountInfo.apartmentNumber}\n📍 Адрес: ${accountInfo.address}\n\nИспользуйте этот номер для входа в приложение УК "Прогресс".`;
                 await sendMessageWithTyping(chatId, accountMessage);
                 // Add the account info to conversation history
                 history.push({ role: "assistant", type: 'text', content: accountMessage });
-                console.log(`Account info sent to ${chatId}: ${accountInfo.accountNumber}`);
+                console.log(`Account info sent to ${chatId}: ${accountInfo.accountNumber}. Data cached.`);
                 return true;
             } else {
                 // Account not found - let AI handle this to continue the conversation

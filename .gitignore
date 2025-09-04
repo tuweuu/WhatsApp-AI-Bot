@@ -36,5 +36,6 @@ Thumbs.db
 history.json
 histories/
 auth-sessions/
+whatsapp_group_preview.html
 # Spreadsheet data files (binary)
 *.xlsx
