@@ -299,6 +299,11 @@ function getClientId() {
     return getBotInstance().clientId;
 }
 
+// Check if current bot is the main bot
+function isMainBot() {
+    return getBotInstance().isMainBot;
+}
+
 module.exports = {
     BOT_INSTANCES,
     getBotInstance,
@@ -306,5 +311,6 @@ module.exports = {
     hasAdminAccess,
     getSystemPrompt,
     getDisplayName,
-    getClientId
+    getClientId,
+    isMainBot
 };

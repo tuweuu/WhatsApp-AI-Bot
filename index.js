@@ -10,7 +10,7 @@ const { Debouncer } = require('@tanstack/pacer');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const { getCurrentBotConfig, hasAdminAccess, getSystemPrompt, getDisplayName, getClientId } = require('./bot-config');
+const { getCurrentBotConfig, hasAdminAccess, getSystemPrompt, getDisplayName, getClientId, isMainBot } = require('./bot-config');
 const { format, isWeekend, isToday, addDays, getDay, setHours, getHours } = require('date-fns');
 const { ru } = require('date-fns/locale');
 require('dotenv').config();
@@ -33,6 +33,24 @@ const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID || null;
 const GENERAL_GROUP_ID = process.env.GENERAL_GROUP_ID || null;
 const ACCOUNTING_GROUP_ID = process.env.ACCOUNTING_GROUP_ID || null;
 const ADMIN_STATE_FILE_PATH = './admin-state.json';
+
+// Groups to ignore - bot will never respond in these groups
+const IGNORED_GROUPS = [
+    '79000501111-1635839546@g.us', // Технический персонал УК «Прогресс»
+    '79993100111-1562266045@g.us', // «Прогресс» | Рабочая
+    '120363181424301003@g.us', // ДагЛифт | УК «Прогресс»
+    '120363409741682571@g.us', // Технички Кадырова 44/46
+    '120363042216780683@g.us', // Камеры/домофония
+    '120363151482260621@g.us', // 👮🏼 Консьержи УК «Прогресс»
+    '120363421039187370@g.us', // 🤖 [bot]: 💰 Бухгалтерия
+    '120363418711369407@g.us', // 🤖 [bot]: 📑 Заявки
+    '120363421860873400@g.us', // 🧾 Квитанции об оплате 💸
+    '120363424059988249@g.us', // 🤖 [bot]: 👨🏻‍💻 Admin
+];
+
+function isIgnoredGroup(groupId) {
+    return IGNORED_GROUPS.includes(groupId);
+}
 
 // Get system prompt from configuration
 const SYSTEM_PROMPT = getSystemPrompt();
@@ -78,11 +96,14 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
+let groupMessageBuffers = {}; // Store pending group messages for each group
+let groupMessageDebouncers = {}; // Store debouncer instances for each group
 let pendingRequests = {}; // Store pending requests waiting for confirmation
 let residentDataCache = {}; // Cache extracted resident data to avoid re-asking
+let botStartTime = null; // Track when the bot started to ignore old messages
 
 // --- TYPING HELPERS (context7 timings) ---
 function calculateTypingDurationMs(text) {
@@ -740,8 +761,24 @@ client.on('qr', qr => {
     console.log(`\n${scanMessage}\n`);
 });
 
-client.on('ready', () => {
+client.on('ready', async () => {
     console.log('Client is ready!');
+    botStartTime = Date.now();
+    console.log(`Bot start time recorded: ${new Date(botStartTime).toLocaleString()}`);
+    
+    // Log all groups the bot is part of
+    try {
+        const chats = await client.getChats();
+        const groups = chats.filter(chat => chat.isGroup && !chat.id._serialized.includes('@broadcast'));
+        
+        console.log(`\n=== BOT IS MEMBER OF ${groups.length} GROUPS ===`);
+        groups.forEach((group, index) => {
+            console.log(`${index + 1}. ${group.name} (${group.id._serialized})`);
+        });
+        console.log('=====================================\n');
+    } catch (error) {
+        console.error('Error getting group list:', error);
+    }
 });
 
 // Track bot's own automated responses to distinguish from live operator messages
@@ -795,8 +832,25 @@ client.on('message_create', async (message) => {
                     messageBuffers[targetChatId] = [];
                     console.log(`Cleared message buffer for ${targetChatId}`);
                 }
+            }
+            
+            // If this is a message to a group, cancel pending group responses
+            if (targetChatId.endsWith('@g.us')) {
+                // Cancel any pending group response
+                if (groupMessageDebouncers[targetChatId]) {
+                    groupMessageDebouncers[targetChatId].cancel();
+                    console.log(`Canceled pending group response for ${targetChatId}`);
+                }
                 
-                // Add the live operator's message to conversation history
+                // Clear group message buffer
+                if (groupMessageBuffers[targetChatId]) {
+                    groupMessageBuffers[targetChatId] = [];
+                    console.log(`Cleared group message buffer for ${targetChatId}`);
+                }
+            }
+            
+            // Add the live operator's message to conversation history for private chats only
+            if (!targetChatId.endsWith('@g.us') && targetChatId !== ADMIN_GROUP_ID) {
                 await historyManager.addMessage(targetChatId, {
                     role: "assistant",
                     type: 'text',
@@ -816,6 +870,12 @@ client.on('message', async message => {
     // Ignore our own outgoing messages to prevent self-triggering on broadcasts/mailing
     if (message.fromMe) return;
 
+    // Ignore messages that were sent before bot started to prevent spam on startup
+    if (botStartTime && message.timestamp * 1000 < botStartTime) {
+        console.log(`Ignoring old message from ${message.from} (sent before bot start)`);
+        return;
+    }
+
     // Route admin group commands before generic group handling
     if (ADMIN_GROUP_ID && message.from === ADMIN_GROUP_ID) {
         try {
@@ -831,6 +891,7 @@ client.on('message', async message => {
 
     if (message.from.endsWith('@g.us')) {
         console.log(`Message received from group: ${message.from}`);
+        await handleGroupMessage(message);
         return;
     }
 
@@ -989,6 +1050,229 @@ client.on('message', async message => {
         await sendReplyWithTyping(message, "Не могу почему то открыть сообщение. Напишите пожалуйста.");
     }
 });
+
+// --- GROUP MESSAGE HANDLING ---
+
+/**
+ * Handles incoming group messages with batching/debouncing system
+ * @param {Object} message - The WhatsApp message from group
+ */
+async function handleGroupMessage(message) {
+    try {
+        // Group responses disabled
+        return;
+        
+        // Only the main bot should respond in groups
+        if (!isMainBot()) {
+            console.log(`Non-main bot ignoring group message from ${message.from}`);
+            return;
+        }
+
+        const groupId = message.from;
+        
+        // Check if this group should be ignored
+        if (isIgnoredGroup(groupId)) {
+            console.log(`Ignoring message from ignored group: ${groupId}`);
+            return;
+        }
+
+        const messageBody = message.body;
+        if (!messageBody || messageBody.trim() === '') {
+            return; // Ignore empty messages
+        }
+
+        // Ignore messages that were sent before bot started to prevent spam on startup
+        if (botStartTime && message.timestamp * 1000 < botStartTime) {
+            console.log(`Ignoring old group message from ${message.from} (sent before bot start)`);
+            return;
+        }
+        
+        // Initialize group message buffer for this group if it doesn't exist
+        if (!groupMessageBuffers[groupId]) {
+            groupMessageBuffers[groupId] = [];
+        }
+
+        // Add message to buffer
+        groupMessageBuffers[groupId].push({
+            message,
+            messageBody,
+            timestamp: Date.now()
+        });
+
+        console.log(`Group message from ${groupId} added to batch (${groupMessageBuffers[groupId].length} messages pending)`);
+
+        // Get or create debouncer for this group and trigger it
+        const debouncer = getOrCreateGroupDebouncer(groupId);
+        debouncer.maybeExecute();
+
+    } catch (error) {
+        console.error('Error handling group message:', error);
+    }
+}
+
+/**
+ * Processes batched group messages for a specific group
+ * @param {string} groupId - The group ID to process messages for
+ */
+async function processBatchedGroupMessages(groupId) {
+    const messages = groupMessageBuffers[groupId];
+    if (!messages || messages.length === 0) {
+        return;
+    }
+
+    console.log(`Processing ${messages.length} batched group messages for ${groupId}`);
+    
+    try {
+        // Process each message in the batch
+        for (const { message, messageBody } of messages) {
+            // Analyze if this message requires management company intervention
+            const needsResponse = await analyzeGroupMessage(messageBody);
+            
+            if (needsResponse) {
+                await sendGroupSmartResponse(message, needsResponse);
+                // Only respond to the first message that needs a response to avoid spam
+                break;
+            }
+        }
+    } catch (error) {
+        console.error("Error processing batched group messages:", error);
+    }
+    
+    // Clear the buffer after processing
+    groupMessageBuffers[groupId] = [];
+}
+
+/**
+ * Gets or creates a debouncer for a specific group
+ * @param {string} groupId - The group ID
+ * @returns {Object} The debouncer instance
+ */
+function getOrCreateGroupDebouncer(groupId) {
+    if (!groupMessageDebouncers[groupId]) {
+        groupMessageDebouncers[groupId] = new Debouncer(
+            () => processBatchedGroupMessages(groupId),
+            { wait: MESSAGE_DEBOUNCE_WAIT }
+        );
+    }
+    return groupMessageDebouncers[groupId];
+}
+
+/**
+ * Analyzes if a group message relates to management company and needs response
+ * @param {string} messageText - The message text to analyze
+ * @returns {Promise<Object|null>} Response details or null if no response needed
+ */
+async function analyzeGroupMessage(messageText) {
+    const GROUP_ANALYSIS_PROMPT = `Analyze this message from a residential group chat to determine if it requires management company intervention.
+
+Message: "${messageText}"
+
+RESPOND if the message is about:
+1. UTILITIES: electricity, water, heating, gas issues
+2. REPAIRS: elevators, lights, doors, windows, plumbing
+3. MAINTENANCE: cleaning, security, building problems
+4. EMERGENCIES: urgent safety issues, accidents
+5. BILLING: payment issues, billing questions, receipt requests
+6. COMPLAINTS: noise, neighbors causing problems that need official intervention
+
+DO NOT respond to:
+- Personal conversations, social chat
+- Lost pets, found items
+- Private neighbor disputes
+- General questions not requiring management action
+- Thank you messages, casual responses
+- Casual communication between residents among themselves
+
+If management intervention is needed, determine the category:
+- "utilities" for water, electricity, heating, gas
+- "repairs" for maintenance, elevators, building issues
+- "billing" for payment, receipt, billing questions
+- "emergency" for urgent safety issues
+- "general" for other management-related issues
+
+Return JSON:
+{
+  "needs_response": true/false,
+  "category": "utilities|repairs|billing|emergency|general" or null,
+  "urgency": "high|medium|low" or null,
+  "summary": "brief issue description" or null
+}`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                { role: "system", content: GROUP_ANALYSIS_PROMPT },
+                { role: "user", content: messageText }
+            ],
+            response_format: { type: "json_object" },
+            max_tokens: 200,
+            temperature: 0.1
+        });
+
+        const analysis = JSON.parse(completion.choices[0].message.content);
+        
+        if (analysis.needs_response) {
+            return {
+                category: analysis.category || 'general',
+                urgency: analysis.urgency || 'medium',
+                summary: analysis.summary || 'Требуется обращение в УК'
+            };
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Error analyzing group message:', error);
+        return null;
+    }
+}
+
+/**
+ * Sends appropriate response to group directing user to private chat
+ * @param {Object} message - The original WhatsApp message
+ * @param {Object} responseDetails - Details about the required response
+ */
+async function sendGroupSmartResponse(message, responseDetails) {
+    const { category, urgency } = responseDetails;
+    
+    // Generate bot phone number for WhatsApp link
+    const botNumber = process.env.BOT_PHONE_NUMBER || '79000501111';
+    const whatsappLink = `https://wa.me/${botNumber}`;
+    
+    let responseText = '';
+    
+    if (urgency === 'high' || category === 'emergency') {
+        responseText = `Для экстренных случаев звоните *8 (800) 444-52-05*\n\n` +
+                      `Для оформления заявки с вашими данными перейдём в личный чат 📨\n\n` +
+                      `👆 Нажмите: ${whatsappLink}`;
+    } else {
+        let categoryMessage = '';
+        switch (category) {
+            case 'utilities':
+                categoryMessage = 'Зафиксировала сообщение по коммунальным услугам.';
+                break;
+            case 'repairs':
+                categoryMessage = 'Зафиксировала сообщение по ремонту/обслуживанию.';
+                break;
+            case 'billing':
+                categoryMessage = 'Зафиксировала сообщение по начислениям.';
+                break;
+            default:
+                categoryMessage = 'Зафиксировала ваше обращение.';
+        }
+        
+        responseText = `${categoryMessage} Чтобы не публиковать персональные данные в группе, продолжим в личных сообщениях 📨\n\n` +
+                      `👆 Нажмите: ${whatsappLink}`;
+    }
+    
+    try {
+        const formattedResponse = formatBotMessage(responseText);
+        await client.sendMessage(message.from, formattedResponse);
+        console.log(`Smart group response sent to ${message.from} for category: ${category}`);
+    } catch (error) {
+        console.error('Error sending smart group response:', error);
+    }
+}
 
 // --- PAYMENT FILE HANDLING ---
 
