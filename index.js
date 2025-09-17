@@ -48,8 +48,21 @@ const IGNORED_GROUPS = [
     '120363424059988249@g.us', // 🤖 [bot]: 👨🏻‍💻 Admin
 ];
 
+// Phone numbers to ignore - bot will never respond to these numbers
+const IGNORED_NUMBERS = [
+    '79000501111@c.us', //Основной бот
+    '79298682421@c.us', //Диспетчер 1
+    '79280453783@c.us', //Диспетчер 2
+    '79387900059@c.us', //Диспетчер 3
+    '79288793111@c.us' //Бухгалтерия
+];
+
 function isIgnoredGroup(groupId) {
     return IGNORED_GROUPS.includes(groupId);
+}
+
+function isIgnoredNumber(chatId) {
+    return IGNORED_NUMBERS.includes(chatId);
 }
 
 // Get system prompt from configuration
@@ -96,7 +109,7 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 2 * 60 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
 let groupMessageBuffers = {}; // Store pending group messages for each group
@@ -892,6 +905,12 @@ client.on('message', async message => {
     if (message.from.endsWith('@g.us')) {
         console.log(`Message received from group: ${message.from}`);
         await handleGroupMessage(message);
+        return;
+    }
+
+    // Check if this number should be ignored
+    if (isIgnoredNumber(message.from)) {
+        console.log(`Ignoring message from ignored number: ${message.from}`);
         return;
     }
 
