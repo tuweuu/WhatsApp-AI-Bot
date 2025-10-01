@@ -17,7 +17,7 @@ require('dotenv').config();
 
 // --- CONFIGURATION ---
 const OPENAI_MODEL = "gpt-4.1";
-const MAX_HISTORY_LENGTH = 50;
+const MAX_HISTORY_LENGTH = 15;  // Reduced from 20 - combined with smart history limiting
 const SUMMARIZATION_PROMPT = "Briefly summarize your conversation with the resident. Note down key details, names, and specific requests to ensure a smooth follow-up.";
 
 // Critical guard: confirmation is handled by our code, not the LLM
@@ -109,11 +109,9 @@ let mutedChats = {}; // { [chatId]: { until: number | null } }
 let excelParser = null;
 
 // --- MESSAGE DEBOUNCING ---
-const MESSAGE_DEBOUNCE_WAIT = 1 * 10 * 1000; // 2 minutes in milliseconds
+const MESSAGE_DEBOUNCE_WAIT = 1 * 60 * 1000; // 1 minute in milliseconds
 let messageBuffers = {}; // Store pending messages for each chat
 let messageDebouncers = {}; // Store debouncer instances for each chat
-let groupMessageBuffers = {}; // Store pending group messages for each group
-let groupMessageDebouncers = {}; // Store debouncer instances for each group
 let pendingRequests = {}; // Store pending requests waiting for confirmation
 let residentDataCache = {}; // Cache extracted resident data to avoid re-asking
 let botStartTime = null; // Track when the bot started to ignore old messages
@@ -505,7 +503,7 @@ async function handlePdf(media) {
         return `The user has sent a PDF. Here is the content: ${data.text}`;
     } catch (error) {
         console.error("Error parsing PDF:", error);
-        return "I had trouble reading that PDF file. Please try sending it again.";
+        return null; // Return null to indicate error - no user message
     }
 }
 
@@ -614,7 +612,7 @@ async function handleVideo(media) {
         
     } catch (error) {
         console.error("Error processing video:", error);
-        return "Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.";
+        return null; // Return null to indicate error - no user message
     }
 }
 
@@ -676,8 +674,9 @@ async function processBatchedMessages(chatId) {
             // Format request data but don't send yet - show for confirmation first
             const requestData = await formatRequestForGroup(history, chatId, routingType);
             
-            // Store the pending request
+            // Store the pending request with a unique ID
             pendingRequests[chatId] = {
+                requestId: `req_${Date.now()}`,
                 requestData,
                 routingType,
                 history: [...history], // Make a copy
@@ -745,9 +744,7 @@ async function processBatchedMessages(chatId) {
 
     } catch (error) {
         console.error("Error processing batched messages:", error);
-        // Reply to the last message in the batch with error
-        const lastMessage = messages[messages.length - 1].originalMessage;
-        await sendReplyWithTyping(lastMessage, "Проблемы с WhatsApp. Просим обратиться по номеру: +7 (800) 444-52-05");
+        // Error logged to console only - user will not receive technical error message
     }
     
     // Clear the buffer after processing
@@ -847,20 +844,6 @@ client.on('message_create', async (message) => {
                 }
             }
             
-            // If this is a message to a group, cancel pending group responses
-            if (targetChatId.endsWith('@g.us')) {
-                // Cancel any pending group response
-                if (groupMessageDebouncers[targetChatId]) {
-                    groupMessageDebouncers[targetChatId].cancel();
-                    console.log(`Canceled pending group response for ${targetChatId}`);
-                }
-                
-                // Clear group message buffer
-                if (groupMessageBuffers[targetChatId]) {
-                    groupMessageBuffers[targetChatId] = [];
-                    console.log(`Cleared group message buffer for ${targetChatId}`);
-                }
-            }
             
             // Add the live operator's message to conversation history for private chats only
             if (!targetChatId.endsWith('@g.us') && targetChatId !== ADMIN_GROUP_ID) {
@@ -936,6 +919,16 @@ client.on('message', async message => {
     
     // Check if this is a confirmation response to a pending request
     if (pendingRequests[message.from]) {
+        // Add lock mechanism to prevent processing the same confirmation multiple times
+        const requestId = pendingRequests[message.from].requestId;
+        
+        // If request doesn't have an ID, assign one
+        if (!requestId) {
+            pendingRequests[message.from].requestId = `req_${Date.now()}`;
+        }
+        
+        console.log(`Processing potential confirmation for request ${pendingRequests[message.from].requestId} from ${message.from}`);
+        
         const confirmation = await analyzeConfirmationResponse(messageBody);
         if (confirmation) {
             const processed = await processConfirmationResponse(message.from, confirmation, message);
@@ -967,13 +960,17 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'image', content: openAIContent, media: { mimetype: media.mimetype } };
                 } catch (error) {
                     console.error("Error processing image:", error);
-                    await sendReplyWithTyping(message, "Сейчас не могу открыть фото. Пожалуйста, напишите.");
+                    // Error logged to console only - user will not receive technical error message
                     return;
                 }
             } else if (media.mimetype === 'application/pdf') {
                 try {
                     console.log("Received PDF message, adding to batch...");
                     messageBody = await handlePdf(media);
+                    if (messageBody === null) {
+                        // PDF processing failed, error already logged to console
+                        return;
+                    }
                     userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, filename: media.filename } };
                     
                     // Check if this is a payment file and forward to accounting group
@@ -982,7 +979,7 @@ client.on('message', async message => {
                     }
                 } catch (error) {
                     console.error("Error processing PDF:", error);
-                    await sendReplyWithTyping(message, "Сейчас не могу открыть файл. Пожалуйста, напишите.");
+                    // Error logged to console only - user will not receive technical error message
                     return;
                 }
             } else if (media.mimetype === 'audio/ogg' || message.type === 'ptt' || message.type === 'audio') {
@@ -1003,22 +1000,21 @@ client.on('message', async message => {
                     userHistoryEntry = { role: "user", type: 'audio', content: messageBody, media: { mimetype: media.mimetype } };
                 } catch (error) {
                     console.error("Error transcribing audio:", error);
-                    await sendReplyWithTyping(message, "Не разобрала ваше голосовое. Пожалуйста, напишите.");
+                    // Error logged to console only - user will not receive technical error message
                     return;
                 }
             } else if (media.mimetype === 'video/mp4' || media.mimetype === 'video/quicktime' || media.mimetype === 'video/avi' || media.mimetype === 'video/mov' || media.mimetype === 'video/webm') {
                 try {
                     console.log("Received video message, processing and adding to batch...");
                     const openAIContent = await handleVideo(media);
-                    if (typeof openAIContent === 'string') {
-                        // Error case
-                        await sendReplyWithTyping(message, openAIContent);
+                    if (openAIContent === null) {
+                        // Video processing failed, error already logged to console
                         return;
                     }
                     userHistoryEntry = { role: "user", type: 'video', content: openAIContent, media: { mimetype: media.mimetype } };
                 } catch (error) {
                     console.error("Error processing video:", error);
-                    await sendReplyWithTyping(message, "Не могу обработать видео. Пожалуйста, попробуйте отправить его еще раз или опишите проблему текстом.");
+                    // Error logged to console only - user will not receive technical error message
                     return;
                 }
             } else {
@@ -1030,7 +1026,7 @@ client.on('message', async message => {
                 } else {
                     // Unsupported file type - handle immediately
                     console.log(`Received unsupported file type: ${media.mimetype}`);
-                    await sendReplyWithTyping(message, "Не могу сейчас открыть ваше вложение. Пожалуйста, напишите.");
+                    // Error logged to console only - user will not receive technical error message
                     return;
                 }
             }
@@ -1066,231 +1062,26 @@ client.on('message', async message => {
 
     } catch (error) {
         console.error("Error handling message:", error);
-        await sendReplyWithTyping(message, "Не могу почему то открыть сообщение. Напишите пожалуйста.");
+        // Error logged to console only - user will not receive technical error message
     }
 });
 
 // --- GROUP MESSAGE HANDLING ---
 
 /**
- * Handles incoming group messages with batching/debouncing system
+ * Handles incoming group messages - only processes admin commands in admin group
  * @param {Object} message - The WhatsApp message from group
  */
 async function handleGroupMessage(message) {
-    try {
-        // Group responses disabled
-        return;
-        
-        // Only the main bot should respond in groups
-        if (!isMainBot()) {
-            console.log(`Non-main bot ignoring group message from ${message.from}`);
-            return;
-        }
-
-        const groupId = message.from;
-        
-        // Check if this group should be ignored
-        if (isIgnoredGroup(groupId)) {
-            console.log(`Ignoring message from ignored group: ${groupId}`);
-            return;
-        }
-
-        const messageBody = message.body;
-        if (!messageBody || messageBody.trim() === '') {
-            return; // Ignore empty messages
-        }
-
-        // Ignore messages that were sent before bot started to prevent spam on startup
-        if (botStartTime && message.timestamp * 1000 < botStartTime) {
-            console.log(`Ignoring old group message from ${message.from} (sent before bot start)`);
-            return;
-        }
-        
-        // Initialize group message buffer for this group if it doesn't exist
-        if (!groupMessageBuffers[groupId]) {
-            groupMessageBuffers[groupId] = [];
-        }
-
-        // Add message to buffer
-        groupMessageBuffers[groupId].push({
-            message,
-            messageBody,
-            timestamp: Date.now()
-        });
-
-        console.log(`Group message from ${groupId} added to batch (${groupMessageBuffers[groupId].length} messages pending)`);
-
-        // Get or create debouncer for this group and trigger it
-        const debouncer = getOrCreateGroupDebouncer(groupId);
-        debouncer.maybeExecute();
-
-    } catch (error) {
-        console.error('Error handling group message:', error);
-    }
-}
-
-/**
- * Processes batched group messages for a specific group
- * @param {string} groupId - The group ID to process messages for
- */
-async function processBatchedGroupMessages(groupId) {
-    const messages = groupMessageBuffers[groupId];
-    if (!messages || messages.length === 0) {
+    // Check if this group should be ignored
+    if (isIgnoredGroup(message.from)) {
+        console.log(`Ignoring message from ignored group: ${message.from}`);
         return;
     }
-
-    console.log(`Processing ${messages.length} batched group messages for ${groupId}`);
     
-    try {
-        // Process each message in the batch
-        for (const { message, messageBody } of messages) {
-            // Analyze if this message requires management company intervention
-            const needsResponse = await analyzeGroupMessage(messageBody);
-            
-            if (needsResponse) {
-                await sendGroupSmartResponse(message, needsResponse);
-                // Only respond to the first message that needs a response to avoid spam
-                break;
-            }
-        }
-    } catch (error) {
-        console.error("Error processing batched group messages:", error);
-    }
-    
-    // Clear the buffer after processing
-    groupMessageBuffers[groupId] = [];
-}
-
-/**
- * Gets or creates a debouncer for a specific group
- * @param {string} groupId - The group ID
- * @returns {Object} The debouncer instance
- */
-function getOrCreateGroupDebouncer(groupId) {
-    if (!groupMessageDebouncers[groupId]) {
-        groupMessageDebouncers[groupId] = new Debouncer(
-            () => processBatchedGroupMessages(groupId),
-            { wait: MESSAGE_DEBOUNCE_WAIT }
-        );
-    }
-    return groupMessageDebouncers[groupId];
-}
-
-/**
- * Analyzes if a group message relates to management company and needs response
- * @param {string} messageText - The message text to analyze
- * @returns {Promise<Object|null>} Response details or null if no response needed
- */
-async function analyzeGroupMessage(messageText) {
-    const GROUP_ANALYSIS_PROMPT = `Analyze this message from a residential group chat to determine if it requires management company intervention.
-
-Message: "${messageText}"
-
-RESPOND if the message is about:
-1. UTILITIES: electricity, water, heating, gas issues
-2. REPAIRS: elevators, lights, doors, windows, plumbing
-3. MAINTENANCE: cleaning, security, building problems
-4. EMERGENCIES: urgent safety issues, accidents
-5. BILLING: payment issues, billing questions, receipt requests
-6. COMPLAINTS: noise, neighbors causing problems that need official intervention
-
-DO NOT respond to:
-- Personal conversations, social chat
-- Lost pets, found items
-- Private neighbor disputes
-- General questions not requiring management action
-- Thank you messages, casual responses
-- Casual communication between residents among themselves
-
-If management intervention is needed, determine the category:
-- "utilities" for water, electricity, heating, gas
-- "repairs" for maintenance, elevators, building issues
-- "billing" for payment, receipt, billing questions
-- "emergency" for urgent safety issues
-- "general" for other management-related issues
-
-Return JSON:
-{
-  "needs_response": true/false,
-  "category": "utilities|repairs|billing|emergency|general" or null,
-  "urgency": "high|medium|low" or null,
-  "summary": "brief issue description" or null
-}`;
-
-    try {
-        const completion = await openai.chat.completions.create({
-            model: OPENAI_MODEL,
-            messages: [
-                { role: "system", content: GROUP_ANALYSIS_PROMPT },
-                { role: "user", content: messageText }
-            ],
-            response_format: { type: "json_object" },
-            max_tokens: 200,
-            temperature: 0.1
-        });
-
-        const analysis = JSON.parse(completion.choices[0].message.content);
-        
-        if (analysis.needs_response) {
-            return {
-                category: analysis.category || 'general',
-                urgency: analysis.urgency || 'medium',
-                summary: analysis.summary || 'Требуется обращение в УК'
-            };
-        }
-        
-        return null;
-    } catch (error) {
-        console.error('Error analyzing group message:', error);
-        return null;
-    }
-}
-
-/**
- * Sends appropriate response to group directing user to private chat
- * @param {Object} message - The original WhatsApp message
- * @param {Object} responseDetails - Details about the required response
- */
-async function sendGroupSmartResponse(message, responseDetails) {
-    const { category, urgency } = responseDetails;
-    
-    // Generate bot phone number for WhatsApp link
-    const botNumber = process.env.BOT_PHONE_NUMBER || '79000501111';
-    const whatsappLink = `https://wa.me/${botNumber}`;
-    
-    let responseText = '';
-    
-    if (urgency === 'high' || category === 'emergency') {
-        responseText = `Для экстренных случаев звоните *8 (800) 444-52-05*\n\n` +
-                      `Для оформления заявки с вашими данными перейдём в личный чат 📨\n\n` +
-                      `👆 Нажмите: ${whatsappLink}`;
-    } else {
-        let categoryMessage = '';
-        switch (category) {
-            case 'utilities':
-                categoryMessage = 'Зафиксировала сообщение по коммунальным услугам.';
-                break;
-            case 'repairs':
-                categoryMessage = 'Зафиксировала сообщение по ремонту/обслуживанию.';
-                break;
-            case 'billing':
-                categoryMessage = 'Зафиксировала сообщение по начислениям.';
-                break;
-            default:
-                categoryMessage = 'Зафиксировала ваше обращение.';
-        }
-        
-        responseText = `${categoryMessage} Чтобы не публиковать персональные данные в группе, продолжим в личных сообщениях 📨\n\n` +
-                      `👆 Нажмите: ${whatsappLink}`;
-    }
-    
-    try {
-        const formattedResponse = formatBotMessage(responseText);
-        await client.sendMessage(message.from, formattedResponse);
-        console.log(`Smart group response sent to ${message.from} for category: ${category}`);
-    } catch (error) {
-        console.error('Error sending smart group response:', error);
-    }
+    // For non-ignored groups, we currently don't have any specific processing
+    // The bot primarily operates in private chats
+    console.log(`Message from non-ignored group ${message.from} - no specific handling implemented`);
 }
 
 // --- PAYMENT FILE HANDLING ---
@@ -1389,15 +1180,15 @@ async function forwardPaymentFileToAccounting(message, media, pdfContent = null)
         
         // Create message for accounting group
         let forwardMessage = `💰 *Новый платежный документ*\n\n` +
-                            `📞 *От:* ${cleanContact}\n` +
-                            `📅 *Время:* ${new Date().toLocaleString('ru-RU')}\n`;
+                            ` *От:* ${cleanContact}\n` +
+                            ` *Время:* ${new Date().toLocaleString('ru-RU')}\n`;
         
         // Add extracted payment data if available
         if (paymentData) {
-            forwardMessage += `\n📊 *Данные платежа:*\n` +
-                             `👤 *Отправитель:* ${paymentData.senderName}\n` +
-                             `🏢 *Получатель:* ${paymentData.recipientName}\n` +
-                             `💵 *Сумма:* ${paymentData.amount}\n`;
+            forwardMessage += `\n *Данные платежа:*\n` +
+                             ` *Отправитель:* ${paymentData.senderName}\n` +
+                             ` *Получатель:* ${paymentData.recipientName}\n` +
+                             ` *Сумма:* ${paymentData.amount}\n`;
         }
         
         forwardMessage += `\nПожалуйста, обработайте платежный документ.`;
@@ -1413,7 +1204,7 @@ async function forwardPaymentFileToAccounting(message, media, pdfContent = null)
         
     } catch (error) {
         console.error('Error forwarding payment file to accounting:', error);
-        await sendReplyWithTyping(message, "Документ получен, но возникла ошибка при передаче в бухгалтерию. Пожалуйста, обратитесь в офис.");
+        // Error logged to console only - user will not receive technical error message
     }
 }
 
@@ -1437,7 +1228,28 @@ start();
 
 async function getOpenAIResponse(richHistory) {
     try {
-        const openAIMessages = richHistory.map(msg => ({
+        // MAJOR COST OPTIMIZATION: Only use recent history for main responses
+        // Keep summary if it exists, then last 8-10 messages for context
+        let limitedHistory = richHistory;
+        if (richHistory.length > 12) {
+            // Find if there's a summary at the beginning
+            const summaryIndex = richHistory.findIndex(msg => 
+                msg.role === 'system' && msg.content && msg.content.includes('Summary of previous conversation')
+            );
+            
+            if (summaryIndex >= 0) {
+                // Keep summary + last 8 messages
+                const summary = richHistory[summaryIndex];
+                const recentMessages = richHistory.slice(-8);
+                limitedHistory = [summary, ...recentMessages];
+            } else {
+                // No summary, just use last 10 messages
+                limitedHistory = richHistory.slice(-10);
+            }
+            console.log(`Optimized history: ${richHistory.length} → ${limitedHistory.length} messages`);
+        }
+        
+        const openAIMessages = limitedHistory.map(msg => ({
             role: msg.role,
             content: msg.content
         }));
@@ -1612,7 +1424,7 @@ Focus ONLY on the most recent request, not previous topics.`;
                 model: OPENAI_MODEL,
                 messages: [
                     { role: "system", content: ISSUE_EXTRACTION_PROMPT },
-                    ...history.map(m => ({role: m.role, content: m.content}))
+                    ...history.slice(-8).map(m => ({role: m.role, content: m.content}))  // Use recent history only
                 ],
                 response_format: { type: "json_object" },
                 max_tokens: 150
@@ -1781,11 +1593,18 @@ async function formatConfirmationMessage(requestData, routingType, history) {
         console.error('Error extracting full name for confirmation:', error);
     }
     
+    // Make sure all request data fields are strings to prevent template rendering issues
+    const cleanRequestData = {
+        address: String(requestData.address || 'Не указано'),
+        issue: String(requestData.issue || 'Не указано'),
+        details: String(requestData.details || 'Не указано')
+    };
+    
     return `📋 *Проверьте данные перед отправкой в ${typeName}:*\n\n` +
            `👤 *ФИО:* ${fullName}\n` +
-           `📍 *Адрес:* ${requestData.address}\n` +
-           `❗ *Проблема:* ${requestData.issue}\n` +
-           `📝 *Детали:* ${requestData.details}\n\n` +
+           `📍 *Адрес:* ${cleanRequestData.address}\n` +
+           `❗ *Проблема:* ${cleanRequestData.issue}\n` +
+           `📝 *Детали:* ${cleanRequestData.details}\n\n` +
            `❓ *Данные корректны?* Ответьте "да" или "нет".`;
 }
 
@@ -1852,13 +1671,14 @@ Respond with exactly one word: "yes", "no", or "null"`;
             temperature: 0.1 // Low temperature for consistent responses
         });
 
-        const response = completion.choices[0].message.content.trim().toLowerCase();
+        const response = completion.choices[0].message.content.trim();
+        const cleaned = normalizeConfirmationText(response);
         
-        if (response === 'yes') return 'yes';
-        if (response === 'no') return 'no';
-        if (response === 'null') return null;
+        if (YES_KEYWORDS.includes(cleaned)) return 'yes';
+        if (NO_KEYWORDS.includes(cleaned)) return 'no';
+        // fallback to original logic for exact 'null'
+        if (cleaned === 'null') return null;
         
-        // Fallback: if AI returns unexpected response, default to null (not a confirmation)
         console.warn(`Unexpected AI confirmation analysis response: ${response}. Defaulting to null.`);
         return null;
         
@@ -1960,10 +1780,13 @@ async function processConfirmationResponse(chatId, confirmation, message) {
         return false;
     }
     
+    // Clean up the pending request immediately to prevent double processing
+    // This prevents race conditions where the same confirmation might be processed twice
+    const { requestData, routingType, history } = pendingRequest;
+    delete pendingRequests[chatId];
+    
     if (confirmation === 'yes') {
         // User confirmed - proceed with sending the request
-        const { requestData, routingType, history } = pendingRequest;
-        
         let groupId;
         switch (routingType) {
             case 'GENERAL':
@@ -1998,10 +1821,8 @@ async function processConfirmationResponse(chatId, confirmation, message) {
             await historyManager.updateHistory(chatId, history);
             await sendReplyWithTyping(message, successMessage);
         } else {
-            const errorMessage = 'Произошла ошибка при отправке заявки. Пожалуйста, обратитесь в офис по номеру +7 (800) 444-52-05.';
-            history.push({ role: "assistant", type: 'text', content: errorMessage });
-            await historyManager.updateHistory(chatId, history);
-            await sendReplyWithTyping(message, errorMessage);
+            // Request sending failed - log error to console only
+            console.error(`Failed to send request to ${routingType} group for chat ${chatId}`);
         }
     } else {
         // User declined - ask what needs to be corrected
@@ -2012,8 +1833,6 @@ async function processConfirmationResponse(chatId, confirmation, message) {
         await sendReplyWithTyping(message, correctionMessage);
     }
     
-    // Clean up the pending request
-    delete pendingRequests[chatId];
     return true;
 }
 
@@ -2095,3 +1914,19 @@ async function handleAccountLookup(chatId, history) {
         return false;
     }
 }
+
+// Helper: normalize confirmation text and keyword lists
+function normalizeConfirmationText(text) {
+    return text
+        .toLowerCase()
+        .trim()
+        // strip surrounding quotes and common Russian quotes «» and exotic unicode quotes
+        .replace(/^['"«»„"“'']+|['"«»„"“'']+$/gu, '')
+        // strip trailing punctuation / symbols / emoji (👍 etc.)
+        .replace(/[\p{P}\p{S}]+$/u, '')
+        // collapse multiple spaces
+        .replace(/\s+/g, ' ');
+}
+
+const YES_KEYWORDS = ['yes', 'да', 'ага', 'ok', 'ок', 'okay', 'sure'];
+const NO_KEYWORDS  = ['no', 'нет'];

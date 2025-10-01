@@ -9,7 +9,7 @@ class HistoryManager {
     constructor(baseDir = './histories') {
         this.baseDir = baseDir;
         this.conversationHistories = {}; // In-memory cache
-        this.maxHistoryLength = 50;
+        this.maxHistoryLength = 20; // Hard limit to prevent massive files (main MAX_HISTORY_LENGTH is 15 + buffer)
     }
 
     /**
@@ -41,7 +41,14 @@ class HistoryManager {
             const filePath = this.getChatFilePath(chatId);
             await fs.access(filePath);
             const data = await fs.readFile(filePath, 'utf8');
-            const history = JSON.parse(data);
+            let history = JSON.parse(data);
+            
+            // Enforce max history length on load (for old large files)
+            if (history.length > this.maxHistoryLength) {
+                console.log(`Truncating loaded history for ${chatId}: ${history.length} → ${this.maxHistoryLength} messages`);
+                history = this.truncateHistory(history);
+            }
+            
             this.conversationHistories[chatId] = history;
             console.log(`Loaded history for chat ${chatId} (${history.length} messages)`);
             return history;
@@ -72,7 +79,6 @@ class HistoryManager {
             const filePath = this.getChatFilePath(chatId);
             const data = JSON.stringify(history, null, 2);
             await fs.writeFile(filePath, data, 'utf8');
-            console.log(`Saved history for chat ${chatId} (${history.length} messages)`);
         } catch (error) {
             console.error(`Error saving history for chat ${chatId}:`, error);
         }
@@ -98,11 +104,42 @@ class HistoryManager {
         
         this.conversationHistories[chatId].push(message);
         
-        // Auto-save after adding message
+        // Enforce max history length
+        if (this.conversationHistories[chatId].length > this.maxHistoryLength) {
+            console.log(`History limit reached for ${chatId}, truncating to ${this.maxHistoryLength} messages`);
+            this.conversationHistories[chatId] = this.truncateHistory(this.conversationHistories[chatId]);
+        }
+        
+        // Save immediately (performance optimization could batch these, but keeping for data safety)
         await this.saveChatHistory(chatId);
         
         // Summarization logic is handled in the main processing flow
         return false;
+    }
+
+    /**
+     * Smart history truncation that preserves summary messages
+     */
+    truncateHistory(history) {
+        if (history.length <= this.maxHistoryLength) {
+            return history;
+        }
+        
+        // Find the most recent summary message (if any)
+        const summaryIndex = history.findIndex(msg => 
+            msg.role === 'system' && msg.content && msg.content.includes('Summary of previous conversation')
+        );
+        
+        if (summaryIndex >= 0) {
+            // Keep summary + recent messages to reach maxHistoryLength
+            const summary = history[summaryIndex];
+            const remainingSlots = this.maxHistoryLength - 1; // -1 for summary
+            const recentMessages = history.slice(-remainingSlots);
+            return [summary, ...recentMessages];
+        } else {
+            // No summary, just keep most recent messages
+            return history.slice(-this.maxHistoryLength);
+        }
     }
 
     /**
