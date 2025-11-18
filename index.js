@@ -54,7 +54,22 @@ const IGNORED_NUMBERS = [
     '79298682421@c.us', //Диспетчер 1
     '79280453783@c.us', //Диспетчер 2
     '79387900059@c.us', //Диспетчер 3
-    '79288793111@c.us' //Бухгалтерия
+    '79288793111@c.us', //Бухгалтерия
+    '79640010622@c.us', //Имран
+    '79285915269@c.us', //Имран 2
+    '79282981666@c.us', //Меседу
+    '79676996992@c.us', //Амина Юрист
+    '79884679629@c.us', //Закир
+    '79285449996@c.us', //Шамиль ТехДиректор
+    '79820001999@c.us', //Диспетчер ДагЛифт
+    '79285222141@c.us', 
+    '79282973633@c.us',
+    '79673972179@c.us',
+    '79679383182@c.us',
+    '79634194605@c.us',
+    '79285552046@c.us',
+    
+
 ];
 
 function isIgnoredGroup(groupId) {
@@ -97,10 +112,20 @@ const botConfig = getCurrentBotConfig();
 console.log(`Starting bot instance: ${botConfig.name} (${botConfig.clientId})`);
 
 const client = new Client({
-    authStrategy: new LocalAuth({
-        clientId: botConfig.clientId,
-        dataPath: `./auth-sessions/${botConfig.clientId}`
-    })
+  authStrategy: new LocalAuth({
+    clientId: botConfig.clientId,
+    dataPath: `./auth-sessions/${botConfig.clientId}`,
+  }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+    ],
+  },
 });
 
 // Initialize the new history manager
@@ -842,6 +867,12 @@ client.on('message_create', async (message) => {
                     messageBuffers[targetChatId] = [];
                     console.log(`Cleared message buffer for ${targetChatId}`);
                 }
+
+                // Clear any pending confirmation request so future "Да/Нет" are ignored
+                if (pendingRequests[targetChatId]) {
+                    delete pendingRequests[targetChatId];
+                    console.log(`Cleared pending confirmation for ${targetChatId} due to live operator message`);
+                }
             }
             
             
@@ -973,10 +1004,8 @@ client.on('message', async message => {
                     }
                     userHistoryEntry = { role: "user", type: 'file', content: messageBody, media: { mimetype: media.mimetype, filename: media.filename } };
                     
-                    // Check if this is a payment file and forward to accounting group
-                    if (await isPaymentFile(messageBody, media.filename)) {
-                        await forwardPaymentFileToAccounting(message, media, messageBody);
-                    }
+                    // Forward every PDF file to the accounting group
+                    await forwardPaymentFileToAccounting(message, media, messageBody);
                 } catch (error) {
                     console.error("Error processing PDF:", error);
                     // Error logged to console only - user will not receive technical error message
@@ -1605,7 +1634,8 @@ async function formatConfirmationMessage(requestData, routingType, history) {
            `📍 *Адрес:* ${cleanRequestData.address}\n` +
            `❗ *Проблема:* ${cleanRequestData.issue}\n` +
            `📝 *Детали:* ${cleanRequestData.details}\n\n` +
-           `❓ *Данные корректны?* Ответьте "да" или "нет".`;
+           `❓ *Данные корректны?* Ответьте "да" или "нет".` +
+           `\n⏳ Собранная информация сбросится через 2 часа, если подтверждения не будет.`;
 }
 
 /**
@@ -1839,8 +1869,8 @@ async function processConfirmationResponse(chatId, confirmation, message) {
 // Clean up expired pending requests and cached data every 5 minutes
 setInterval(() => {
     const now = Date.now();
-    const expireTime = 10 * 60 * 1000; // 10 minutes
-    const cacheExpireTime = 60 * 60 * 1000; // 1 hour for cached data
+    const expireTime = 120 * 60 * 1000; // 2 hours 
+    const cacheExpireTime = 120 * 60 * 1000; // 2 hours for cached data
     
     for (const [chatId, request] of Object.entries(pendingRequests)) {
         if (now - request.timestamp > expireTime) {
@@ -1929,4 +1959,4 @@ function normalizeConfirmationText(text) {
 }
 
 const YES_KEYWORDS = ['yes', 'да', 'ага', 'ok', 'ок', 'okay', 'sure'];
-const NO_KEYWORDS  = ['no', 'нет'];
+const NO_KEYWORDS = ['no', 'нет', 'неа', 'nope', 'not'];
